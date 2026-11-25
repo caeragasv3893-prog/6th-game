@@ -3,7 +3,7 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, 'fix/nvidia-compatibility']
 
 permissions:
   contents: read
@@ -30,4 +30,6 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       # Includes xtask's repository_passes_policy, the asset-policy check.
       - name: Tests
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked -- --test-threads=1
+      - name: Release build
+        run: cargo build --release -p victory --locked
