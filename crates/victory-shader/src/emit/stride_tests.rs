@@ -854,6 +854,88 @@ fn wave64_integer_butterfly_reductions_cross_warps() {
 }
 
 #[test]
+fn wave64_recognized_integer_sum_uses_shared_reduction() {
+    use super::wave::{Op, Shape};
+    let vop3 = |dst: u32, op: u32, a: u32, b: u32, c: u32| {
+        [0xD400_0000 | (op << 16) | dst, a | (b << 9) | (c << 18)]
+    };
+    let add = |dst: u32, a: u32, b: u32| {
+        (0x25 << 25) | (dst << 17) | (b << 9) | a
+    };
+    let mut words = vec![
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202, 0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xBE98_25C1, // s_or_saveexec_b64 s[24:25], -1
+    ];
+    words.extend(vop3(1, 0x101, 128, 256, 24)); // v_cndmask_b32 v1, 0, v0, s[24:25]
+    for shift in [1u32, 2, 4, 8] {
+        words.push(add(1, 0xFA, 1));
+        words.push(0xFF00_0001 | ((0x110 + shift) << 8)); // row_shr DPP
+    }
+    for (reg, lane) in [(16, 15), (17, 31), (18, 47), (19, 63)] {
+        words.extend(vop3(reg, 0x360, 257, 128 + lane, 0)); // read each row sum
+    }
+    words.extend([
+        0x7E06_0210, // v_mov_b32 v3, s16
+        add(3, 17, 3),
+        add(3, 18, 3),
+        add(3, 19, 3),
+        0xBEFE_0418, // s_mov_b64 exec, s[24:25]
+        0xE070_1000, 0x8002_0302, // buffer_store_dword v3, v2, s[8:11], 0 offen
+        0xBF81_0000,
+    ]);
+    // Verify the actual symbolic recognizer, not only the emitted output.
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let p = ir::build(&code, true, 8).unwrap();
+    let sections = super::wave::sections(&p, 0);
+    assert!(sections.values().any(|sec| sec.shapes.values().any(
+        |sh| matches!(sh, Shape::Active(Op::AddU, _, _, 0))
+    )), "the reduction must be recognized");
+    let shader = build_wave(
+        &words,
+        vec![param(RootType::Table, 0)],
+        vec![entry(ResourceType::Uav, 4, 0)],
+        128,
+        true,
+    );
+    let c = crate::Container::parse(&shader.dxil).unwrap();
+    let psv = c.part(crate::FourCC::PSV0).unwrap().data;
+    assert_eq!(u32::from_le_bytes(psv[20..24].try_into().unwrap()), 0);
+    assert_eq!(u32::from_le_bytes(psv[24..28].try_into().unwrap()), u32::MAX);
+    let want: Vec<u32> = (0..128).map(|i| if i < 64 { 2016 } else { 6112 }).collect();
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host.compute_pipeline(&shader).unwrap_or_else(
+            |e| panic!("{label}: compute pipeline failed: {e}"),
+        );
+        let out = host.dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(vec![0; shader.user_data_dwords().max(1) as usize]))],
+                views: &[View::RawUav(128)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        ).unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        assert_eq!(out[0], want, "{label}");
+        eprintln!("{label}: recognized wave64 sum passed");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+#[test]
 fn a_half_buffer_load_by_index_reads_the_structured_element() {
     let mut code = HALF_LOAD_WAVE32.to_vec();
     // buffer_load_ushort v2, v0, s[8:11], 0 idxen offset:6.
