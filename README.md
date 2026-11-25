@@ -261,6 +261,31 @@ cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-features --locked -- --test-threads=1
 ```
 
+### Indexed structured sub-dword loads (2026-11-25)
+
+The translator now accepts byte and halfword buffer reads with an explicit
+element index and a known dword-aligned structured stride. It preserves the
+element index and uses the aligned intra-element byte offset in a structured
+DXIL load, then extracts the requested signed or unsigned field. Existing
+byte-addressed reads share the structured load helper. Unknown structured
+strides remain unsupported; halfwords crossing a dword boundary are not
+covered by this change.
+
+A new synthetic compute regression checks a 16-bit field at byte offset 6
+in each of 32 separate 12-byte elements, with distinct neighbouring data.
+The reference arithmetic was checked for all 32 lanes. Windows compilation
+and hardware/WARP dispatch validation are pending.
+
+```powershell
+cargo test -p victory-shader --lib --locked a_half_buffer_load -- --test-threads=1 --nocapture
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+```
+
+Native merged geometry programs still require stage-specific I/O, lowering
+and pipeline integration; the existing rectangle geometry generator is not
+a translator for those programs. No change to native geometry translation
+or wave64 emulation is claimed in this revision.
+
 ### Development roadmap
 
 - [x] Build the project on the NVIDIA test machine.
