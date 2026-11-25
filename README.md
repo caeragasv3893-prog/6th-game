@@ -1036,6 +1036,36 @@ pending Windows validation; the preceding revision remains the last
 validated checkpoint. General divergent branches and loops, AMD
 hardware testing and real title validation remain open.
 
+### Portable Wave64 exchange pipelining (candidate)
+
+Private LDS now alternates two banks in proven group-uniform exchange
+sequences. Each publication barrier also retires the previous bank's
+readers before that bank is reused. Uniform control-flow edges retire
+pending readers before a successor starts at bank zero. A single exchange
+at shader end needs only one bank; other scratch users retain the existing
+safe synchronization path.
+
+The emitted barrier budget is one per straight-line exchange (formerly
+two), or one per exchange plus one retirement per nonterminal block.
+Recognized integer prefix scans and FP32 extrema use seven barriers
+instead of twelve, preserving the original arithmetic and partial-wave
+identity rules. Ordered FP32/FP16 sums, ballots, atomic reductions, and
+title LDS are unchanged. Two scratch banks cost at most 8 KiB per group
+and are reserved only for eligible repeated exchanges or scan/extrema
+rounds. No physical wave lane ordering assumption is introduced.
+
+New synthetic tests check emitted barrier counts, scratch allocation,
+bank reuse over partial and full groups up to 1024 threads, and reuse
+across uniform loop edges. Hardware/WARP correctness and performance
+of this candidate remain unverified until Windows validation; reduced
+barrier count is not an observed GPU speedup.
+
+```powershell
+cargo test -p victory-shader --lib --locked wave64_ -- --test-threads=1 --nocapture
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --release -p victory-shader --lib --locked benchmark_wave64_portable_exchange -- --ignored --test-threads=1 --nocapture
+```
+
 ### Development roadmap
 
 - [x] Build the project on the NVIDIA test machine.
