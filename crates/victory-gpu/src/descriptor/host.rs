@@ -398,14 +398,20 @@ impl HostHeap {
     /// for unordered access to a buffer shaders cannot write.
     pub(crate) fn raw_view_at(&self, index: u32, buffer: Option<&ID3D12Resource>, first: u64, bytes: u64, uav: bool) {
         let Some(host) = host() else { return };
-        let writable = |b: &ID3D12Resource| {
-            // SAFETY: a live buffer.
-            unsafe { b.GetDesc() }.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 != 0
-        };
-        let buffer = buffer.filter(|&b| !uav || writable(b));
+        if self.sampler || index >= victory_shader::emit::HEAP_VIEWS {
+            tracing::warn!(index, "invalid raw descriptor slot");
+            return;
+        }
+        let buffer = buffer.filter(|b| {
+            // SAFETY: a live resource.
+            let desc = unsafe { b.GetDesc() };
+            desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER
+                && raw_range_valid(desc.Width, first, bytes)
+                && (!uav || desc.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 != 0)
+        });
         // shortcut: a buffer view holds at most 2^27 elements (512 MiB raw).
         let (first, elements) = match buffer {
-            Some(_) => (first / 4, (bytes / 4).clamp(1, 1 << 27) as u32),
+            Some(_) => (first / 4, (bytes / 4).min(1 << 27) as u32),
             // A null view still names its size.
             None => (0, 1),
         };
@@ -575,7 +581,10 @@ impl HostHeap {
     /// on first use from the slots made so far.
     pub(crate) fn view_addresses(&self) -> Option<u64> {
         let made = self.addresses.get_or_init(|| {
-            let (buffer, data) = host()?.upload_buffer(u64::from(self.count) * 8)?;
+            let bytes = u64::from(victory_shader::emit::HEAP_VIEWS) * 8;
+            let (buffer, data) = host()?.upload_buffer(bytes)?;
+            // SAFETY: the whole mapped table has this many bytes.
+            unsafe { std::ptr::write_bytes(data, 0, bytes as usize) };
             crate::host::name(&buffer, || "view addresses".into());
             let data = data as usize;
             let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
@@ -602,48 +611,12 @@ impl HostHeap {
     /// (a multiple of 4) of `buffer`, which they hold; null views for no
     /// buffer.
     pub(crate) fn raw_pair_at(&self, index: u32, buffer: Option<&ID3D12Resource>, bytes: u64) {
-        let Some(host) = host() else { return };
-        // shortcut: a buffer view holds at most 2^27 elements (512 MiB raw);
-        // a longer copy's rest reads 0 through it.
-        let elements = (bytes / 4).min(1 << 27) as u32;
-        let srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
-            Format: DXGI_FORMAT_R32_TYPELESS,
-            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
-            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                Buffer: D3D12_BUFFER_SRV {
-                    FirstElement: 0,
-                    NumElements: elements,
-                    StructureByteStride: 0,
-                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
-                },
-            },
-        };
-        let uav = D3D12_UNORDERED_ACCESS_VIEW_DESC {
-            Format: DXGI_FORMAT_R32_TYPELESS,
-            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
-            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
-                Buffer: D3D12_BUFFER_UAV {
-                    NumElements: elements,
-                    Flags: D3D12_BUFFER_UAV_FLAG_RAW,
-                    ..Default::default()
-                },
-            },
-        };
-        // SAFETY: slots of our heap; the buffer is live (or none: null views).
-        unsafe {
-            host.device
-                .CreateShaderResourceView(buffer, Some(&srv), self.cpu(index));
-            host.device
-                .CreateUnorderedAccessView(buffer, None, Some(&uav), self.cpu(index + 1));
+        if self.sampler || index >= victory_shader::emit::HEAP_VIEWS - 1 {
+            tracing::warn!(index, "invalid raw descriptor pair");
+            return;
         }
-        self.keep(index, buffer.map(|b| (b.clone(), None)));
-        self.keep(index + 1, buffer.map(|b| (b.clone(), None)));
-        self.write_stride(index, 4);
-        self.write_stride(index + 1, 4);
-        // Writes through these are title memory's, marked in its page table.
-        self.set_mark(index, None);
-        self.set_mark(index + 1, None);
+        self.raw_view_at(index, buffer, 0, bytes, false);
+        self.raw_view_at(index + 1, buffer, 0, bytes, true);
     }
 
     /// The shader-visible handle of slot `index`.
@@ -979,6 +952,13 @@ fn buffer_srv(
 fn in_buffer(buffer: &ID3D12Resource, first: u64, count: u32, element: u64) -> bool {
     // SAFETY: a live buffer.
     within(unsafe { buffer.GetDesc() }.Width, first, count, element)
+}
+
+fn raw_range_valid(width: u64, first: u64, bytes: u64) -> bool {
+    bytes != 0
+        && first.is_multiple_of(4)
+        && bytes.is_multiple_of(4)
+        && first.checked_add(bytes).is_some_and(|end| end <= width)
 }
 
 fn within(width: u64, first: u64, count: u32, element: u64) -> bool {
@@ -1481,6 +1461,31 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_ranges_reject_overflow_and_invalid_alignment() {
+        assert!(raw_range_valid(64, 0, 64));
+        assert!(raw_range_valid(64, 60, 4));
+        assert!(!raw_range_valid(64, 64, 4));
+        assert!(!raw_range_valid(64, 0, 0));
+        assert!(!raw_range_valid(64, 2, 4));
+        assert!(!raw_range_valid(64, 0, 3));
+        assert!(!raw_range_valid(u64::MAX, u64::MAX - 3, 4));
+    }
+
+    #[test]
+    fn raw_companions_share_pairs_and_keep_stable_indices() {
+        let Some(host) = host() else { return };
+        let Some(heap) = HostHeap::new(false, 4) else { return };
+        let (buffer, _) = host.upload_buffer(64).unwrap();
+        let first = heap.raw_srv_alias(0, &buffer, 0, 64);
+        let second = heap.raw_srv_alias(1, &buffer, 0, 64);
+        assert_eq!(second, first + 1);
+        assert_eq!(heap.raw_srv_alias(0, &buffer, 4, 60), first);
+        heap.clear_raw_srv_alias(0);
+        assert_eq!(heap.raw_srv_alias(0, &buffer, 0, 64), first);
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
 
     #[test]
     fn portable_heap_layout_reserves_null_and_dynamic_slots() {
