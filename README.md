@@ -342,7 +342,13 @@ results and unrestricted shaders retain their existing behavior. An
 advertised range is not proof that every width in that range works.
 
 Three new tests cover the feature limits, actual device reporting and
-PSV parsing (including truncated metadata). Windows validation is pending.
+PSV parsing (including truncated metadata). Windows validation at revision
+`dbf4f26` passed all four targeted wave tests (0.21 s), including the
+existing console capability test, and strict all-features Clippy (3.71 s).
+The RTX 5060 Ti reports WaveOps=true, WaveLaneCountMin=32 and
+WaveLaneCountMax=32. The tester reported a clean working tree after
+stashing unrelated local modifications. Full workspace regression and
+release validation for this revision remain pending.
 This is a diagnostic prerequisite, not a wave64-on-wave32 emulator; such
 shaders still require a correctness-preserving lowering strategy. Skipped
 pipelines may still leave rendering incomplete.
