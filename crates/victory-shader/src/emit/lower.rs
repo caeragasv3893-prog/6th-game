@@ -679,7 +679,9 @@ impl<'a> Lower<'a> {
             };
             let wave = if x.native.wave64 { 64 } else { 32 };
             let one_wave = cs.threads.iter().product::<u32>() <= wave;
-            // Scratch operations require no title LDS and a single block.
+            // Scratch operations require no title LDS and group-uniform
+            // control flow. The multi-block subset is restricted to
+            // bpermute with scalar-only group-uniform branches.
             // Explicit bpermute admits per-instruction EXEC masks.
             // Uniform ballots also admit partial waves. Other cross-lane
             // operations retain complete-wave and full-EXEC restrictions;
@@ -707,6 +709,30 @@ impl<'a> Lower<'a> {
                 !matches!(i.name(), "ds_swizzle_b32" | "v_readlane_b32")
                 && !matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some()));
             let uniform = x.st.guards.iter().flatten().all(|g| g.is_none() || *g == Some(Bool::TRUE));
+            // A scalar is not necessarily uniform across a whole group:
+            // a readlane or ballot can differ between logical waves.
+            // Exclude all such sources, all EXEC changes and all lane
+            // branches in the multi-block subset. Remaining scalar
+            // inputs are user data/group IDs, and scalar definitions
+            // use only scalar operands, so all threads follow the same
+            // edges (including loop back edges).
+            let group_flow = p.blocks.len() > 1 && exchange_only && uniform
+                && p.inputs.iter().all(|&(r, v)| {
+                    !matches!(r, Reg::S(_)) || x.io.inputs.iter()
+                        .find(|&&(id, _)| id == v)
+                        .is_none_or(|&(_, input)| matches!(input, Input::GroupId(_)))
+                })
+                && x.st.exits.iter().all(|exit| match *exit {
+                    LaneExit::Jump(_) | LaneExit::End => true,
+                    LaneExit::Branch { when, .. } => x.st.bools.support(when).iter()
+                        .all(|a| matches!(a, Atom::Uniform(_))),
+                    LaneExit::Indirect => false,
+                })
+                && insts().all(|i| {
+                    !i.writes.iter().any(|&(r, _)| matches!(r, Reg::S(106..=127)))
+                        && (!matches!(&i.fields, Fields::Sop { .. })
+                            || i.reads.iter().all(|&(r, _)| matches!(r, Reg::S(0..=103) | Reg::Scc)))
+                });
             let guarded_exchanges = exchange_only && p.blocks.len() == 1
                 && p.blocks[0].insts.iter().enumerate().all(|(n, i)| {
                     let g = x.st.guards[0][n];
@@ -721,7 +747,7 @@ impl<'a> Lower<'a> {
                     && (reduction || uniform || guarded_exchanges))
                 && console_lanes
                 && s.lds_dwords == 0
-                && p.blocks.len() == 1
+                && (p.blocks.len() == 1 || group_flow)
                 && (reduction || insts().all(|i| {
                     if reads_mask_as_data(x.st, i)
                         && !matches!(i.name(), "v_mov_b32" | "s_bcnt1_i32_b64")
@@ -737,6 +763,10 @@ impl<'a> Lower<'a> {
                         "s_mov_b32" | "s_load_dwordx4" => i.writes.iter().all(
                             |&(r, _)| matches!(r, Reg::S(0..=103)),
                         ),
+                        "s_add_u32" | "s_sub_u32" | "s_cmp_eq_u32"
+                        | "s_cmp_lg_u32" if group_flow => i.writes.iter().all(
+                            |&(r, _)| matches!(r, Reg::S(0..=103) | Reg::Scc)),
+                        "s_branch" | "s_cbranch_scc0" | "s_cbranch_scc1" if group_flow => true,
                         "s_mov_b64" if guarded_exchanges => matches!(&i.fields,
                             Fields::Sop { dst: Some(Operand::Scalar { code: EXEC, .. }), src, .. }
                                 if matches!(src.first(), Some(Operand::Const(128..=208) | Operand::Literal(_)))),
