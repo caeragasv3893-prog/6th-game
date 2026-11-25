@@ -1633,6 +1633,107 @@ fn wave64_recognized_fp32_extrema_across_warps() {
 }
 
 #[test]
+fn wave64_recognized_fp16_sum_rounds_each_step() {
+    use super::wave::{Op, Shape};
+    let vop3 = |dst: u32, op: u32, a: u32, b: u32, c: u32| {
+        [0xD400_0000 | (op << 16) | dst, a | (b << 9) | (c << 18)]
+    };
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let (op, opcode, identity) = (Op::AddH, 0x32u32, 0u32);
+    let combine = |dst: u32, a: u32, b: u32| {
+        (opcode << 25) | (dst << 17) | (b << 9) | a
+    };
+    let mut words = vec![
+        0xBE84_0300, 0xBE85_0380,
+        0xF408_0202, 0xFA00_0000,
+        0xBE8C_0302, 0xBE8D_0380,
+        0xF408_0406, 0xFA00_0000,
+        0x3404_0082,
+        0xBF8C_C07F,
+        0xE030_1000, 0x8002_0502, // read FP16 words in v5
+        0xBF8C_3F70,
+        0xBE98_25C1, // save EXEC
+    ];
+    words.extend(vop3(1, 0x101, 255, 261, 24));
+    words.push(identity);
+    for shift in [1u32, 2, 4, 8] {
+        words.push(combine(1, 0xFA, 1));
+        words.push(0xFF00_0001 | ((0x110 + shift) << 8));
+    }
+    // Keep s[16:19] intact: they hold the UAV descriptor.
+    for (reg, lane) in [(20, 15), (21, 31), (22, 47), (23, 63)] {
+        words.extend(vop3(reg, 0x360, 257, 128 + lane, 0));
+    }
+    words.extend([
+        0x7E06_0214, // v_mov_b32 v3, s20
+        combine(3, 21, 3),
+        combine(3, 22, 3),
+        combine(3, 23, 3),
+        0xBEFE_0418,
+        0xE070_1000, 0x8004_0302,
+        0xBF81_0000,
+    ]);
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let p = ir::build(&code, true, 8).unwrap();
+    assert!(super::wave::sections(&p, 0).values().any(|sec| {
+        sec.shapes.values().any(|sh| matches!(sh,
+            Shape::Half(found, _, _, id, 15) if *found == op && *id == identity))
+    }), "{op:?}: ordered sum must be recognized");
+    let shader = build_wave(
+        &words,
+        vec![param(RootType::Table, 0), param(RootType::Table, 2)],
+        vec![entry(ResourceType::Srv, 4, 0), entry(ResourceType::Uav, 4, 2)],
+        128,
+        true,
+    );
+    let c = crate::Container::parse(&shader.dxil).unwrap();
+    let psv = c.part(crate::FourCC::PSV0).unwrap().data;
+    assert_eq!(u32::from_le_bytes(psv[20..24].try_into().unwrap()), 0);
+    assert_eq!(u32::from_le_bytes(psv[24..28].try_into().unwrap()), u32::MAX);
+    let input: Vec<u32> = (0..128u32).map(|i| {
+        let half = if i < 64 {
+            [0x3c00, 0x4000, 0x4400, 0x4800][i as usize % 4]
+        } else {
+            match i { 64 => 0x6800, 65 => 0x3c00, _ => 0 }
+        };
+        ((0xa000 + i) << 16) | half
+    }).collect();
+    // 240 exactly, and 2048 + 1 rounded to 2048 at the first add.
+    let expected = [0xa00f_5b80, 0xa04f_6800];
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host.compute_pipeline(&shader).unwrap_or_else(
+            |e| panic!("{label}: compute pipeline failed: {e}"),
+        );
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = if u.slot == 0 { 0 } else { 32 };
+        }
+        let out = host.dispatch(
+            &root, &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::Buffer { data: &input, stride: Stride::Raw }, View::RawUav(128)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        ).unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        for (lane, &bits) in out[0].iter().enumerate() {
+            assert_eq!(bits, expected[lane / 64], "{label}: FP16 sum lane {lane}");
+        }
+        eprintln!("{label}: recognized ordered wave64 FP16 sum passed");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+#[test]
 fn wave64_recognized_fp32_sum_preserves_association() {
     use super::wave::{Op, Shape};
     let vop3 = |dst: u32, op: u32, a: u32, b: u32, c: u32| {
