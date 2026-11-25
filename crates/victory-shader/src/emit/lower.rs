@@ -4299,6 +4299,26 @@ impl<'a> Lower<'a> {
         self.as_int(x)
     }
 
+    /// Read one dword at a byte address using a structured SRV. The DXIL
+    /// element index and the byte offset within that element are distinct.
+    fn structured_dword(&mut self, h: V, at: V, stride: u32) -> V {
+        let c = self.cur;
+        let stride = self.s.m.i32(stride);
+        let element = self.s.m.bin(c, Bin::UDiv, at, stride);
+        let within = self.s.m.bin(c, Bin::URem, at, stride);
+        let (mask, align) = (self.s.m.i8(1), self.s.m.i32(4));
+        let r = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[h, element, within, mask, align],
+        );
+        let x = self.s.m.extract(c, r, 0);
+        self.as_int(x)
+    }
+
     /// Marks the pages a write of `bytes` bytes at byte `x` of the unordered
     /// buffer view `h` touches, in the lanes `guard` lets through (module
     /// notes, "Write marks"): the bits of its first and last byte, each set
@@ -9068,19 +9088,20 @@ impl<'a> Lower<'a> {
             }
             let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
             let at = self.s.m.bin(c, Bin::And, off, not3);
-            let (h, at) = self.raw_view(site, src, at, 4, (11 | u, 0), false, guard)?;
+            let w = if let Some(used) = used
+                && used.root == RootType::Table
+                && used.kind == ResourceType::Srv
+                && used.stride >= 4
+                && used.stride.is_multiple_of(4)
+            {
+                let stride = used.stride;
+                let h = self.handle(site, src, false, (12, stride))?;
+                self.structured_dword(h, at, stride)
+            } else {
+                let (h, at) = self.raw_view(site, src, at, 4, (11 | u, 0), false, guard)?;
+                self.raw_dword(h, at)
+            };
             let c = self.cur;
-            let (mask, align) = (self.s.m.i8(1), self.s.m.i32(4));
-            let r = self.s.op(
-                c,
-                "rawBufferLoad.f32",
-                Attr::ReadOnly,
-                self.s.t.res_ret,
-                139,
-                &[h, at, iu, mask, align],
-            );
-            let w = self.s.m.extract(c, r, 0);
-            let w = self.as_int(w);
             let byte = self.s.m.bin(c, Bin::And, off, three);
             let sh = self.s.m.bin(c, Bin::Shl, byte, three);
             let x = self.s.m.bin(c, Bin::LShr, w, sh);
@@ -9112,24 +9133,10 @@ impl<'a> Lower<'a> {
             let Some(Operand::Vector { reg, .. }) = *data else {
                 return Err("a buffer result");
             };
-            let stride = self.s.m.i32(stride);
-            let mask = self.s.m.i8(1);
-            let align = self.s.m.i32(4);
             for k in 0..count {
                 let delta = self.s.m.i32(4 * k);
                 let byte = self.s.m.bin(c, Bin::Add, off, delta);
-                let element = self.s.m.bin(c, Bin::UDiv, byte, stride);
-                let within = self.s.m.bin(c, Bin::URem, byte, stride);
-                let r = self.s.op(
-                    c,
-                    "rawBufferLoad.f32",
-                    Attr::ReadOnly,
-                    self.s.t.res_ret,
-                    139,
-                    &[h, element, within, mask, align],
-                );
-                let x = self.s.m.extract(c, r, 0);
-                let x = self.as_int(x);
+                let x = self.structured_dword(h, byte, stride);
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());
