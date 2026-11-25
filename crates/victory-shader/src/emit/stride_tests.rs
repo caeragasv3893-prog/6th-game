@@ -686,6 +686,14 @@ fn wave64_ballot_reconstructs_both_mask_words_and_count() {
         0xE070_1600, 0x8002_0302, // store at offset 1536
         0x7E06_026B, // v_mov_b32 v3, vcc_hi
         0xE070_1800, 0x8002_0302, // store at offset 2048
+        0x7D84_009F, // v_cmp_eq_u32 vcc, 31, v0
+        0x7E06_026A, // v_mov_b32 v3, vcc_lo
+        0xE070_1A00, 0x8002_0302, // store at offset 2560
+        0x7E06_026B, // v_mov_b32 v3, vcc_hi
+        0xE070_1C00, 0x8002_0302, // store at offset 3072
+        0x7D84_00FF, 127, // v_cmp_eq_u32 vcc, 127, v0
+        0x7E06_026B, // v_mov_b32 v3, vcc_hi
+        0xE070_1E00, 0x8002_0302, // store at offset 3584
         0xBF81_0000, // s_endpgm
     ];
     let shader = build_wave(
@@ -705,6 +713,9 @@ fn wave64_ballot_reconstructs_both_mask_words_and_count() {
         [40, 0],
         [u32::MAX, u32::MAX],
         [u32::MAX, 0],
+        [0x8000_0000, 0],
+        [0, 0],
+        [0, 0x8000_0000],
     ].into_iter().flat_map(|pair| (0..128).map(move |i| pair[i / 64])).collect();
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
@@ -724,7 +735,7 @@ fn wave64_ballot_reconstructs_both_mask_words_and_count() {
                 &pso,
                 &Dispatch {
                     roots: vec![(0, Root::Constants(vec![0; shader.user_data_dwords().max(1) as usize]))],
-                    views: &[View::RawUav(640)],
+                    views: &[View::RawUav(1024)],
                     samplers: &[],
                     groups: [1, 1, 1],
                 },
