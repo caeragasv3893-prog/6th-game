@@ -483,7 +483,7 @@ fn portable_reduction_section(x: &Parts<'_>) -> bool {
             && matches!(i.name(), "v_cndmask_b32" | "v_mov_b32" | "v_readlane_b32"
                 | "v_permlanex16_b32" | "v_add_nc_u32" | "v_sub_nc_u32" | "v_min_u32" | "v_max_u32"
                 | "v_min_i32" | "v_max_i32" | "v_and_b32" | "v_or_b32" | "v_xor_b32"
-                | "v_min_f32" | "v_max_f32")
+                | "v_min_f32" | "v_max_f32" | "v_add_f32")
             && i.writes.iter().all(|&(r, _)| matches!(r, Reg::V(_) | Reg::S(0..=103)))
     }) {
         return false;
@@ -517,6 +517,11 @@ fn portable_reduction_section(x: &Parts<'_>) -> bool {
                     Some(Shape::Active(op, src, mask, _))
                         if (integer_reduction_op(*op).is_some() || matches!(op, Op::MinF | Op::MaxF))
                             && *mask == saved && !defined.contains(src) => {
+                        live = true;
+                    }
+                    Some(Shape::Active(Op::AddF, src, mask, ident))
+                        if *mask == saved && !defined.contains(src)
+                            && super::wave::ordered_sum(inside, v, *src, saved, *ident).is_some() => {
                         live = true;
                     }
                     Some(Shape::Prefix(Op::AddU, src, mask, 0, _))
@@ -1240,7 +1245,19 @@ impl<'a> Lower<'a> {
         for &(_, w) in &inst.writes {
             let val = if self.section_out.contains(&w) {
                 let shape = self.sections[&b][&start].shapes.get(&w).copied();
-                match shape.ok_or(UNKNOWN).and_then(|sh| self.shape(sh)) {
+                let lowered = match shape {
+                    Some(super::wave::Shape::Active(super::wave::Op::AddF, src, mask, ident))
+                        if self.portable_lanes => {
+                        let end = self.sections[&b][&start].end;
+                        let tree = super::wave::ordered_sum(
+                            &self.x.p.blocks[b].insts[start + 1..end], w, src, mask, ident,
+                        );
+                        tree.ok_or("an unrecognized ordered FP32 sum")
+                            .and_then(|tree| self.portable_ordered_sum(src, tree))
+                    }
+                    _ => shape.ok_or(UNKNOWN).and_then(|sh| self.shape(sh)),
+                };
+                match lowered {
                     Ok(x) => Val::I32(x),
                     Err(why) => Val::Missing(why),
                 }
@@ -2065,6 +2082,51 @@ impl<'a> Lower<'a> {
             sum = self.s.m.bin(c, Bin::Add, sum, x);
         }
         if inclusive { sum } else { self.s.m.bin(c, Bin::Sub, sum, value) }
+    }
+
+    /// Replay the original FP32 expression graph over logical lanes.
+    /// Eligibility proves full original EXEC; publish every input once,
+    /// then evaluate only the graph reachable from the uniform result.
+    fn portable_ordered_sum(
+        &mut self, source: Value, tree: super::wave::OrderedSum,
+    ) -> Result<V, Why> {
+        let value = self.i32_of(source)?;
+        let c = self.cur;
+        let flat = self.mesh_thread();
+        let mask = self.s.m.i32(!63u32);
+        let base = self.s.m.bin(c, Bin::And, flat, mask);
+        let lds = self.s.lds();
+        let own = self.s.m.element(c, lds, flat);
+        let mode = self.s.m.i32(1 | 8);
+        let mut needed = vec![false; 64 + tree.adds.len()];
+        needed[tree.root] = true;
+        for (i, &(a, b)) in tree.adds.iter().enumerate().rev() {
+            if needed[64 + i] {
+                needed[a] = true;
+                needed[b] = true;
+            }
+        }
+        self.s.m.store(c, own, value);
+        self.s.op(c, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[mode]);
+        let mut values = vec![None; needed.len()];
+        for lane in 0..64 {
+            if needed[lane] {
+                let k = self.s.m.i32(lane as u32);
+                let index = self.s.m.bin(c, Bin::Or, base, k);
+                let ptr = self.s.m.element(c, lds, index);
+                let bits = self.s.m.load(c, ptr);
+                values[lane] = Some(self.as_float(bits));
+            }
+        }
+        self.s.op(c, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[mode]);
+        for (i, &(a, b)) in tree.adds.iter().enumerate() {
+            if needed[64 + i] {
+                let lhs = values[a].expect("reachable sum operand");
+                let rhs = values[b].expect("reachable sum operand");
+                values[64 + i] = Some(self.s.m.bin(c, Bin::Add, lhs, rhs));
+            }
+        }
+        Ok(self.as_int(values[tree.root].expect("reachable sum result")))
     }
 
     /// Fixed butterfly over the logical wave. Use the normal FP extrema
