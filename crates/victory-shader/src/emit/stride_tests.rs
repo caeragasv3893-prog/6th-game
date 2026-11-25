@@ -665,6 +665,68 @@ fn wave64_bpermute_exchanges_values_across_warps() {
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
 
+#[test]
+fn wave64_bpermute_group_uniform_branch_and_loop() {
+    let words = [
+        0xBE84_0300, 0xBE85_0380,
+        0xF408_0202, 0xFA00_0000,
+        0x3404_0082, 0xBF8C_C07F,
+        0x7E06_0300, // v3 = v0
+        0xBE94_0383, // s20 = 3
+        0xBF06_8214, // loop: s_cmp_eq_u32 s20, 2
+        0xBF85_0003, // skip the exchange on the middle iteration
+        0xDACC_0004, 0x0300_0302,
+        0xBF8C_C07F,
+        0x8094_8114, // s_sub_u32 s20, s20, 1
+        0xBF06_8014, // s_cmp_eq_u32 s20, 0
+        0xBF84_FFF8, // s_cbranch_scc0 -> loop
+        0xE070_1000, 0x8002_0302,
+        0xBF81_0000,
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        for threads in [33u32, 64, 96, 128] {
+            let shader = build_wave(
+                &words,
+                vec![param(RootType::Table, 0)],
+                vec![entry(ResourceType::Uav, 4, 0)],
+                threads,
+                true,
+            );
+            let c = crate::Container::parse(&shader.dxil).unwrap();
+            let psv = c.part(crate::FourCC::PSV0).unwrap().data;
+            assert_eq!(u32::from_le_bytes(psv[20..24].try_into().unwrap()), 0);
+            assert_eq!(u32::from_le_bytes(psv[24..28].try_into().unwrap()), u32::MAX);
+            let (root, pso) = host.compute_pipeline(&shader).unwrap_or_else(
+                |e| panic!("{label}: compute pipeline failed: {e}"),
+            );
+            let mut expected: Vec<u32> = (0..threads).collect();
+            for _ in 0..2 {
+                expected = (0..threads).map(|i| {
+                    let src = (i & !63) | ((i + 1) & 63);
+                    expected.get(src as usize).copied().unwrap_or(0)
+                }).collect();
+            }
+            let out = host.dispatch(&root, &pso, &Dispatch {
+                roots: vec![(0, Root::Constants(vec![0; shader.user_data_dwords().max(1) as usize]))],
+                views: &[View::RawUav(threads)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            }).unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            assert_eq!(out[0], expected, "{label}: threads={threads}");
+        }
+        eprintln!("{label}: group-uniform branch and loop passed");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
 /// End-to-end timing plus GPU timestamps around Dispatch.
 /// The zero-exchange control includes queue/resource creation, submission,
 /// synchronization and readback. All workloads write the same 128 dwords.
