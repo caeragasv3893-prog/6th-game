@@ -38,6 +38,7 @@ const RTV_RING: u32 = 1024;
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
+    memory_adapter: Option<IDXGIAdapter3>,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
@@ -237,8 +238,19 @@ fn create() -> windows::core::Result<Host> {
             ),
             Err(e) => tracing::debug!(error = %e, "multiply-add fusing not checked"),
         }
+        let memory_adapter = match video_memory_adapter(&device) {
+            Ok(adapter) => {
+                log_video_memory(&adapter);
+                Some(adapter)
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "DXGI memory telemetry unavailable");
+                None
+            }
+        };
         Ok(Host {
             device,
+            memory_adapter,
             queue,
             fence,
             submitted: Mutex::new(0),
@@ -255,6 +267,48 @@ fn create() -> windows::core::Result<Host> {
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(Presentation::default()),
         })
+    }
+}
+
+/// Query the adapter actually backing this device, not the first GPU in
+/// the system (which can be a different adapter on hybrid PCs).
+fn video_memory_adapter(device: &ID3D12Device) -> windows::core::Result<IDXGIAdapter3> {
+    // SAFETY: these are plain queries on a live D3D12 device and DXGI factory.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+        factory.EnumAdapterByLuid(device.GetAdapterLuid())
+    }
+}
+
+fn video_memory_info(
+    adapter: &IDXGIAdapter3,
+    segment: DXGI_MEMORY_SEGMENT_GROUP,
+) -> windows::core::Result<DXGI_QUERY_VIDEO_MEMORY_INFO> {
+    let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+    // SAFETY: a live adapter, node zero, and a writable information structure.
+    unsafe { adapter.QueryVideoMemoryInfo(0, segment, &mut info) }?;
+    Ok(info)
+}
+
+fn log_video_memory(adapter: &IDXGIAdapter3) {
+    for (name, segment) in [
+        ("local", DXGI_MEMORY_SEGMENT_GROUP_LOCAL),
+        ("non-local", DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL),
+    ] {
+        match video_memory_info(adapter, segment) {
+            Ok(info) => {
+                let mib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
+                tracing::info!(
+                    segment = name,
+                    usage_mib = mib(info.CurrentUsage),
+                    budget_mib = mib(info.Budget),
+                    headroom_mib = mib(info.Budget.saturating_sub(info.CurrentUsage)),
+                    over_budget_mib = mib(info.CurrentUsage.saturating_sub(info.Budget)),
+                    "DXGI process video memory"
+                );
+            }
+            Err(e) => tracing::debug!(error = %e, segment = name, "DXGI memory query failed"),
+        }
     }
 }
 
@@ -282,6 +336,25 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn video_memory_budget_reports_segments() {
+        let Some(host) = super::host() else {
+            eprintln!("no host D3D12 device; skipped");
+            return;
+        };
+        let adapter = super::video_memory_adapter(&host.device).expect("device's DXGI adapter");
+        for (name, segment) in [
+            ("local", super::DXGI_MEMORY_SEGMENT_GROUP_LOCAL),
+            ("non-local", super::DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL),
+        ] {
+            let info = super::video_memory_info(&adapter, segment).expect("DXGI memory info");
+            eprintln!(
+                "{name}: usage={} bytes, budget={} bytes, reservation={} bytes",
+                info.CurrentUsage, info.Budget, info.CurrentReservation
+            );
+        }
+    }
+
     #[test]
     fn swap_chain_failures_retry_once_per_second_and_success_clears_the_wait() {
         use super::{Duration, Instant, SwapChainRetry};
@@ -2338,7 +2411,7 @@ impl Meter {
     }
 
     /// Counts a presented frame.
-    fn frame(&mut self, hwnd: HWND) {
+    fn frame(&mut self, hwnd: HWND, host: &Host) {
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         self.frames += 1;
@@ -2378,6 +2451,9 @@ impl Meter {
         let drops = crate::pipeline::take_drops();
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
+            if let Some(adapter) = &host.memory_adapter {
+                log_video_memory(adapter);
+            }
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
@@ -2535,7 +2611,7 @@ impl Host {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
-            p.meter.frame(p.hwnd);
+            p.meter.frame(p.hwnd, self);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
             #[cfg(not(feature = "diagnostics"))]
