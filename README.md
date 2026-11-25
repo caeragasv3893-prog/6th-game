@@ -1016,9 +1016,19 @@ EXEC. Removing this branch preserves predicated VGPR writes while
 allowing all group threads to execute the shared-scratch barriers.
 The regression covers empty, full, constant and dynamic partial masks;
 IR tests reject scalar side effects, missing restores and wave32.
-This change awaits Windows compilation and runtime validation.
-General lane-divergent branches and loops remain open; no title data
-or AMD validation is claimed.
+Windows validation at `6c244b5` passed 28 targeted wave64 tests
+(27.16 s), all executed workspace tests (276 shader tests, four ignored;
+155 GPU tests, three ignored), strict Clippy and the release build.
+
+Revision `b3cba4f` extends this narrow transformation to lane-local
+v_mov_b32 and v_add_nc_u32 with VGPR destinations, excluding DPP,
+SDWA and output modifiers. Masked arithmetic preserves inactive VGPRs.
+The added regression checks a predicated add after the exchange,
+including a second exchange after EXEC restore, for empty, full,
+constant and dynamic masks and eight group sizes. This revision is
+pending Windows validation; the preceding revision remains the last
+validated checkpoint. General divergent branches and loops, AMD
+hardware testing and real title validation remain open.
 
 ### Development roadmap
 
