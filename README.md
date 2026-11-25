@@ -228,6 +228,26 @@ descriptor allocator, 100,000 allocation/release cycles took 3.0081 ms in
 this run. The three reference-data tests require external fixtures. The
 separate fused multiply-add test remains a known host-dependent shader issue.
 
+### Structured table SRV sub-dword loads (2026-11-25)
+
+The shader translator now uses a structured DXIL handle for byte and halfword
+loads from table SRVs with a known dword-aligned structure stride. It reads
+the enclosing dword using the element index and intra-element offset, then
+extracts and extends the requested field. The previous full-dword structured
+read path shares this lowering. Raw table views and direct-heap companion
+views retain their existing paths.
+
+A new synthetic test reads 32 consecutive halfwords across 12-byte structured
+elements, using the hardware and WARP dispatch paths. The original raw SRV
+test is unchanged. This correction is implemented but has not yet been
+compiled or executed on Windows.
+
+```powershell
+cargo test -p victory-shader --lib --locked a_half_buffer_load -- --test-threads=1 --nocapture
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-features --locked -- --test-threads=1
+```
+
 ### Development roadmap
 
 - [x] Build the project on the NVIDIA test machine.
