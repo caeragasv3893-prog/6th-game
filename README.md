@@ -893,10 +893,27 @@ lane reads over two logical waves. Windows validation of revision `2a1248a` pass
 (4.49 s), all executed workspace tests (265 shader tests, three ignored)
 and the release build (16.13 s). Strict Clippy reported only a fixed-size
 chunk lint in the balanced selection; revision `5964418` replaces
-`chunks_exact(2)` with `as_chunks::<2>()`, pending revalidation.
+`chunks_exact(2)` with `as_chunks::<2>()`. Windows strict Clippy at
+revision `98cce6e` passed in 3.40 s.
 General divergent control flow,
 unrecognized FP16 operations, partial groups and measured performance
 remain open. No AMD or title gameplay validation is claimed.
+
+### Partial logical waves and constant EXEC bpermute (2026-11-25)
+
+The explicit bpermute-only portable subset now permits compute groups
+from 1 to 1024 threads, including a final incomplete logical wave.
+Scratch reads of absent lanes select an in-bounds address and return
+zero. Straight-line bpermute under constant EXEC masks also publishes
+zero for inactive source lanes and preserves inactive destinations.
+All existing group threads still execute both barriers. Other
+cross-lane operations retain their existing eligibility restrictions.
+
+The new regression covers group widths 1, 31, 33, 63, 65, 96, 127 and
+128, full and constant-masked EXEC, missing sources and scratch reuse.
+Windows compilation, strict Clippy and hardware/WARP execution are
+pending. Arbitrary divergent branches and loops, partial-wave
+reductions and performance measurements are not yet covered.
 
 ### Development roadmap
 
