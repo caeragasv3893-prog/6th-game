@@ -331,6 +331,27 @@ cargo test -p victory-gpu --lib --locked descriptor::host::tests -- --test-threa
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 ```
 
+### Wave capability preflight (2026-11-25)
+
+The host now queries D3D12 OPTIONS1 on its actual device, logs WaveOps and
+the minimum/maximum lane counts, and checks the exact wave-width declared
+in a translated shader's PSV0 before creating a pipeline. A width excluded
+by known device capabilities is reported as an unsupported pipeline rather
+than left to a generic pipeline creation failure. Unknown feature-query
+results and unrestricted shaders retain their existing behavior. An
+advertised range is not proof that every width in that range works.
+
+Three new tests cover the feature limits, actual device reporting and
+PSV parsing (including truncated metadata). Windows validation is pending.
+This is a diagnostic prerequisite, not a wave64-on-wave32 emulator; such
+shaders still require a correctness-preserving lowering strategy. Skipped
+pipelines may still leave rendering incomplete.
+
+```powershell
+cargo test -p victory-gpu --lib --locked wave -- --test-threads=1 --nocapture
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+```
+
 ### Development roadmap
 
 - [x] Build the project on the NVIDIA test machine.
