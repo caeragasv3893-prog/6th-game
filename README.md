@@ -889,9 +889,12 @@ measured GPU execution time.
 
 New synthetic regressions cover the recognized FP16 sum, including
 intermediate rounding and high-half preservation, and the additional
-lane reads over two logical waves. These changes and the previous
-DPP revision still require Windows compilation, strict Clippy, DXIL
-and hardware/WARP validation. General divergent control flow,
+lane reads over two logical waves. Windows validation of revision `2a1248a` passed all 17 wave64 tests
+(4.49 s), all executed workspace tests (265 shader tests, three ignored)
+and the release build (16.13 s). Strict Clippy reported only a fixed-size
+chunk lint in the balanced selection; revision `5964418` replaces
+`chunks_exact(2)` with `as_chunks::<2>()`, pending revalidation.
+General divergent control flow,
 unrecognized FP16 operations, partial groups and measured performance
 remain open. No AMD or title gameplay validation is claimed.
 
