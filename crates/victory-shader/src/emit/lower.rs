@@ -223,6 +223,8 @@ struct Lower<'a> {
     /// Compute code that reads other lanes: thread ids follow the host
     /// lanes, so lane n is console lane n.
     console_lanes: bool,
+    /// Straight-line wave64 code with only lane-local numbering.
+    portable_lanes: bool,
     /// Pixel: an ordered section (POPS), whose UAVs the host makes
     /// rasterizer-ordered views.
     pops: bool,
@@ -492,6 +494,7 @@ impl<'a> Lower<'a> {
         let root_memory = x.res.scalar.iter().any(|s| matches!(s.1.param, MEMORY | USER_DATA))
             || insts().any(|i| i.name().starts_with("image_bvh"));
         let mut console_lanes = false;
+        let mut portable_lanes = false;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -532,7 +535,36 @@ impl<'a> Lower<'a> {
             };
             let wave = if x.native.wave64 { 64 } else { 32 };
             let one_wave = cs.threads.iter().product::<u32>() <= wave;
-            if console_lanes || one_wave && s.lds_dwords > 0 {
+            // A narrow, deliberately conservative portable subset:
+            // MBCNT of a literal mask only depends on the console lane
+            // number, not on another lane's value. A straight-line shader
+            // with no shared memory, mask changes or cross-lane operations
+            // can derive that number from the flat group thread ID.
+            portable_lanes = x.native.wave64
+                && console_lanes
+                && s.lds_dwords == 0
+                && p.blocks.len() == 1
+                && insts().all(|i| {
+                    if reads_mask_as_data(x.st, i) {
+                        return false;
+                    }
+                    match i.name() {
+                        "v_mbcnt_lo_u32_b32" | "v_mbcnt_hi_u32_b32" => {
+                            matches!(&i.fields, Fields::Valu(v)
+                                if v.dpp.is_none()
+                                && matches!(v.src.first(), Some(Operand::Const(193))))
+                        }
+                        "s_mov_b32" | "s_load_dwordx4" => i.writes.iter().all(
+                            |&(r, _)| matches!(r, Reg::S(0..=103)),
+                        ),
+                        "v_mov_b32" | "v_lshlrev_b32" => {
+                            matches!(&i.fields, Fields::Valu(v) if v.dpp.is_none())
+                        }
+                        "s_waitcnt" | "s_endpgm" | "buffer_store_dword" => true,
+                        _ => false,
+                    }
+                });
+            if !portable_lanes && (console_lanes || one_wave && s.lds_dwords > 0) {
                 s.wave_size = Some(wave);
             }
         }
@@ -622,6 +654,7 @@ impl<'a> Lower<'a> {
             heap: [false; 2],
             src0: None,
             console_lanes,
+            portable_lanes,
             pops: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
                 if db_shader_control & 1 << 16 != 0),
             root_memory,
@@ -2759,7 +2792,7 @@ impl<'a> Lower<'a> {
     /// plus the lane index. (A bijection while each host wave holds a
     /// wave-aligned run of flat ids, as the console's waves do.)
     fn thread_id(&mut self, c: u8) -> Val {
-        if !self.console_lanes {
+        if !self.console_lanes || self.portable_lanes {
             return self.compute_id("threadIdInGroup.i32", 95, c);
         }
         let [x, y, _] = self.s.threads.expect("compute");
@@ -2863,8 +2896,8 @@ impl<'a> Lower<'a> {
     }
 
     fn lane_index(&mut self) -> V {
-        if self.s.mesh.is_some() {
-            // The console's lane: mesh code reads no other lanes, so host
+        if self.s.mesh.is_some() || self.portable_lanes {
+            // The console's lane: this code reads no other lanes, so host
             // waves need not match the console's.
             let f = self.mesh_thread();
             let m = self.s.m.i32(self.wave() - 1);
