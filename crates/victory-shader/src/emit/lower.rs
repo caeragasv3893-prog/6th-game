@@ -568,7 +568,12 @@ impl<'a> Lower<'a> {
                         "s_bcnt1_i32_b64" => i.writes.iter().all(
                             |&(r, _)| matches!(r, Reg::S(0..=103) | Reg::Scc),
                         ),
-                        "v_mov_b32" | "v_lshlrev_b32" => {
+                        // Lane-local integer arithmetic can follow a
+                        // portable exchange to implement a butterfly reduction.
+                        // DPP still requires the original fixed-width path.
+                        "v_mov_b32" | "v_lshlrev_b32" | "v_add_nc_u32"
+                        | "v_min_u32" | "v_max_u32" | "v_min_i32" | "v_max_i32"
+                        | "v_and_b32" | "v_or_b32" | "v_xor_b32" => {
                             matches!(&i.fields, Fields::Valu(v) if v.dpp.is_none())
                         }
                         "v_cmp_gt_u32" | "v_cmp_eq_u32" => {
