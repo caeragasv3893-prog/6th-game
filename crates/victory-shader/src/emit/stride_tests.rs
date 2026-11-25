@@ -1223,14 +1223,15 @@ fn wave64_recognized_fp32_extrema_across_warps() {
             words.push(combine(1, 0xFA, 1));
             words.push(0xFF00_0001 | ((0x110 + shift) << 8));
         }
-        for (reg, lane) in [(16, 15), (17, 31), (18, 47), (19, 63)] {
+        // Keep s[16:19] intact: they hold the UAV descriptor.
+        for (reg, lane) in [(20, 15), (21, 31), (22, 47), (23, 63)] {
             words.extend(vop3(reg, 0x360, 257, 128 + lane, 0));
         }
         words.extend([
-            0x7E06_0210,
-            combine(3, 17, 3),
-            combine(3, 18, 3),
-            combine(3, 19, 3),
+            0x7E06_0214, // v_mov_b32 v3, s20
+            combine(3, 21, 3),
+            combine(3, 22, 3),
+            combine(3, 23, 3),
             0xBEFE_0418,
             0xE070_1000, 0x8004_0302,
             0xBF81_0000,
