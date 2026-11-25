@@ -793,10 +793,13 @@ The new regression checks rounding-sensitive row sums, signed zeros,
 infinities and NaN classification on two logical waves. One input has
 row totals 16777216, 1, 1 and -16777216: the original row-combination
 order yields 0, while regrouping yields 1. Independent FP32 arithmetic
-confirmed both results. Compilation, DXIL validation and GPU execution
-of the new regression are pending. This does not establish bit-exact
-behavior for arbitrary FP modes, NaN payloads or general divergent
-sections. FP16, floating-point prefix scans and performance remain open.
+confirmed both results. Windows validation at revision `17ed30f`
+passed all eleven targeted wave64 tests in 3.47 s with zero failures.
+Both hardware and WARP explicitly passed the recognized ordered FP32
+sum regression. Strict all-features Clippy passed in 3.21 s.
+This does not establish bit-exact behavior for arbitrary FP modes,
+NaN payloads or general divergent sections. Full workspace regression,
+release build, FP16, floating-point prefix scans and performance remain open.
 
 ```powershell
 cargo test -p victory-shader --lib --locked wave64_ -- --test-threads=1 --nocapture
