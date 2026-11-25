@@ -9041,7 +9041,7 @@ impl<'a> Lower<'a> {
         {
             let stride = used.stride;
             let h = self.handle(site, src, false, (12, stride))?;
-            let Operand::Vector { reg, .. } = *data else {
+            let Some(Operand::Vector { reg, .. }) = *data else {
                 return Err("a buffer result");
             };
             let stride = self.s.m.i32(stride);
