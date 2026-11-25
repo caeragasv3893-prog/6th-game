@@ -1004,9 +1004,21 @@ EXEC changes, lane-dependent branch predicates, scalar values produced
 by cross-lane operations, title LDS and indirect exits. Scalar loop
 counters and SCC branches are permitted under these restrictions.
 A regression executes a three-iteration loop with a skipped middle
-exchange, on group sizes 33, 64, 96 and 128. The new path awaits Windows
-compilation and runtime validation. Arbitrary lane-divergent control
-flow remains open; no title data or AMD validation is claimed.
+exchange, on group sizes 33, 64, 96 and 128. Windows validation at `d03fb0f` passed 26 targeted wave64 tests
+(25.21 s), every executed workspace test (274 shader tests, four ignored;
+155 GPU tests, three ignored), and the release build (19.94 s).
+
+Revision `3620c27` adds a narrowly proven IR simplification of forward
+`s_cbranch_execz` skips in otherwise linear wave64 programs. A skipped
+body may contain only register-only `ds_bpermute_b32` exchanges and
+scheduling instructions, and the target must immediately restore full
+EXEC. Removing this branch preserves predicated VGPR writes while
+allowing all group threads to execute the shared-scratch barriers.
+The regression covers empty, full, constant and dynamic partial masks;
+IR tests reject scalar side effects, missing restores and wave32.
+This change awaits Windows compilation and runtime validation.
+General lane-divergent branches and loops remain open; no title data
+or AMD validation is claimed.
 
 ### Development roadmap
 
