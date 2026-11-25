@@ -77,16 +77,51 @@ fn pooled(n: usize) -> Vec<u8> {
 fn give_back(v: Vec<u8>) {
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
+    trim_pool(&mut pool, pool_limit());
+}
+
+/// Keep the largest buffers first, without exceeding the byte budget.
+fn trim_pool(pool: &mut Vec<Vec<u8>>, limit: usize) {
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
-    let mut total = 0;
+    let mut remaining = limit;
     pool.retain(|v| {
-        total += v.capacity();
-        total <= POOL_BYTES
+        if v.capacity() > remaining {
+            return false;
+        }
+        remaining -= v.capacity();
+        true
     });
 }
 
-/// Snapshot memory kept for reuse.
+/// Default snapshot memory kept for reuse (not a limit on active snapshots).
 const POOL_BYTES: usize = 2 << 30;
+
+fn parse_pool_limit(value: Option<&str>) -> Option<usize> {
+    value?.parse::<usize>().ok()?.checked_mul(1 << 20)
+}
+
+fn pool_limit() -> usize {
+    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let value = std::env::var("VICTORY_SNAPSHOT_POOL_MIB").ok();
+        let limit = parse_pool_limit(value.as_deref()).unwrap_or_else(|| {
+            if value.is_some() {
+                tracing::warn!("invalid VICTORY_SNAPSHOT_POOL_MIB; using default");
+            }
+            POOL_BYTES
+        });
+        tracing::info!(limit_mib = limit / (1 << 20), "CPU snapshot reuse pool limit");
+        limit
+    })
+}
+
+/// The idle CPU snapshot pool, separate from active snapshots and VRAM.
+pub(crate) fn log_pool() {
+    let pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    let bytes = pool.iter().map(Vec::capacity).sum::<usize>();
+    tracing::info!(buffers = pool.len(), idle_mib = bytes as f64 / (1024.0 * 1024.0),
+        limit_mib = pool_limit() / (1 << 20), "CPU snapshot reuse pool");
+}
 
 // SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
 // written only on the submitting thread.
@@ -1021,6 +1056,27 @@ pub(crate) fn near(va: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_pool_budget_parsing_is_checked() {
+        assert_eq!(parse_pool_limit(Some("512")), Some(512 << 20));
+        assert_eq!(parse_pool_limit(Some("0")), Some(0));
+        assert_eq!(parse_pool_limit(None), None);
+        assert_eq!(parse_pool_limit(Some("-1")), None);
+        assert_eq!(parse_pool_limit(Some("invalid")), None);
+        assert_eq!(parse_pool_limit(Some(&usize::MAX.to_string())), None);
+    }
+
+    #[test]
+    fn snapshot_pool_stays_within_budget_and_reuses_smaller_buffers() {
+        let mut pool = vec![Vec::with_capacity(128), Vec::with_capacity(64), Vec::with_capacity(32)];
+        let limit = pool[1].capacity() + pool[2].capacity();
+        trim_pool(&mut pool, limit);
+        assert_eq!(pool.len(), 2);
+        assert!(pool.iter().map(Vec::capacity).sum::<usize>() <= limit);
+        trim_pool(&mut pool, 0);
+        assert!(pool.is_empty());
+    }
 
     /// The title writes a constant under a range an earlier list of the
     /// submission declared as written by shaders: the refresh before the
