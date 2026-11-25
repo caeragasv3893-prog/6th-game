@@ -1290,6 +1290,29 @@ impl Host {
         pso: &ID3D12PipelineState,
         d: &Dispatch,
     ) -> Result<Vec<Vec<u32>>, String> {
+        self.dispatch_inner(root, pso, d, None)
+    }
+
+    /// Like dispatch, but also measure the interval immediately around
+    /// Dispatch on the queue's GPU timestamp clock.
+    pub fn dispatch_timed(
+        &self,
+        root: &ID3D12RootSignature,
+        pso: &ID3D12PipelineState,
+        d: &Dispatch,
+    ) -> Result<(Vec<Vec<u32>>, f64), String> {
+        let mut gpu_ms = 0.0;
+        let out = self.dispatch_inner(root, pso, d, Some(&mut gpu_ms))?;
+        Ok((out, gpu_ms))
+    }
+
+    fn dispatch_inner(
+        &self,
+        root: &ID3D12RootSignature,
+        pso: &ID3D12PipelineState,
+        d: &Dispatch,
+        gpu_ms: Option<&mut f64>,
+    ) -> Result<Vec<Vec<u32>>, String> {
         let dev = &self.device;
         // SAFETY: D3D12 calls with descriptions that outlive them; resources
         // stay alive until the fence says the GPU is done.
@@ -1817,8 +1840,39 @@ impl Host {
                     }
                 }
             }
+            let timing = if gpu_ms.is_some() {
+                let mut heap: Option<ID3D12QueryHeap> = None;
+                dev.CreateQueryHeap(
+                    &D3D12_QUERY_HEAP_DESC {
+                        Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
+                        Count: 2,
+                        NodeMask: 0,
+                    },
+                    &mut heap,
+                ).map_err(err)?;
+                let heap = heap.ok_or("no timestamp query heap")?;
+                let back = make(
+                    D3D12_HEAP_TYPE_READBACK,
+                    &buffer(16, D3D12_RESOURCE_FLAG_NONE),
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                )?;
+                let frequency = queue.GetTimestampFrequency().map_err(err)?;
+                if frequency == 0 {
+                    return Err("zero timestamp frequency".into());
+                }
+                Some((heap, back, frequency))
+            } else {
+                None
+            };
             let [x, y, z] = d.groups;
+            if let Some((heap, _, _)) = &timing {
+                list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+            }
             list.Dispatch(x, y, z);
+            if let Some((heap, back, _)) = &timing {
+                list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+                list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, back, 0);
+            }
             for (r, size, n, rb) in &uavs {
                 // (Buffers were promoted from the common state by the dispatch.)
                 list.ResourceBarrier(&[transition(
@@ -1847,6 +1901,16 @@ impl Host {
                     return Err(format!("device removed: {}", err(e)));
                 }
                 std::thread::yield_now();
+            }
+            if let (Some(ms), Some((_, back, frequency))) = (gpu_ms, &timing) {
+                let mut p = std::ptr::null_mut();
+                let range = D3D12_RANGE { Begin: 0, End: 16 };
+                back.Map(0, Some(&range), Some(&mut p)).map_err(err)?;
+                let ticks = std::slice::from_raw_parts(p.cast::<u64>(), 2);
+                let elapsed = ticks[1].checked_sub(ticks[0]);
+                back.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
+                *ms = elapsed.ok_or("nonmonotonic GPU timestamps")? as f64
+                    * 1000.0 / *frequency as f64;
             }
             let mut out = Vec::new();
             for (_, size, n, rb) in &uavs {
