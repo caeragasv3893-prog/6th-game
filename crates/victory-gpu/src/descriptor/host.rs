@@ -1967,6 +1967,8 @@ mod tests {
         super::super::record(handle, first.clone());
         assert_eq!(heap.mirror(title_slot, handle, false), Some(first));
         assert_eq!(mapped(), physical);
+        assert_eq!(heap.title_index(physical), Some(title_slot));
+        assert_eq!(heap.title_index(heap.count), None);
         assert!(heap.made(physical));
 
         let second = View::Constant(0, 32);
@@ -1976,6 +1978,7 @@ mod tests {
         assert_eq!(heap.mirror(end, handle, false), None);
         assert_eq!(heap.mirror(title_slot + 1, handle, false), Some(second));
         assert!(heap.made(physical + 1));
+        assert_eq!(heap.title_index(physical + 1), Some(title_slot + 1));
 
         // SAFETY: the descriptor record is local and the handle points to it.
         unsafe { (handle as *mut u32).write(0) };
@@ -2020,6 +2023,21 @@ mod tests {
 
     /// Typed buffer views of integer formats carry their kind in the
     /// view-stride table; float, normalized, raw and structured ones none.
+    #[test]
+    fn view_format_metadata_does_not_overlap_raw_companions() {
+        let Some(heap) = HostHeap::new(false, 4) else { return };
+        let (_, data) = heap.strides.as_ref().unwrap();
+        let packed = (123_456u32 << 12) | 4;
+        heap.write_stride(0, packed);
+        heap.write_kind(0, victory_shader::emit::VIEW_INTEGER | victory_shader::emit::VIEW_SIGNED);
+        // SAFETY: both plane entries are within the allocated table.
+        unsafe {
+            assert_eq!((*data as *const u32).add(VIEW_STRIDE_BASE as usize).read_volatile(), packed);
+            assert_eq!((*data as *const u32).add(victory_shader::emit::VIEW_KIND_BASE as usize).read_volatile(),
+                victory_shader::emit::VIEW_INTEGER | victory_shader::emit::VIEW_SIGNED);
+        }
+    }
+
     #[test]
     fn integer_typed_buffer_views_are_marked_in_the_stride_table() {
         use victory_shader::emit::{VIEW_INTEGER, VIEW_SIGNED};
