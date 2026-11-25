@@ -696,6 +696,9 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
     assert!(!table.view_marks, "a table read marks nothing");
     let l = lower_with(RootType::ResourceHeap, Vec::new(), 32);
     assert!(l.view_marks && l.heap, "a heap-direct read is marked");
+    assert_eq!(l.root_srvs, [super::VIEW_STRIDES], "heap remap metadata binding");
+    assert!(!l.memory && !l.memory_writes && !l.view_addresses);
+    assert!(l.root_cbvs.is_empty() && l.root_uavs.is_empty());
     let shader = HostShader {
         stage: HwStage::Cs,
         dxil: l.dxil,
@@ -736,8 +739,10 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
                 &Dispatch {
                     roots: vec![
                         (0, Root::Constants(ud)),
-                        (1, Root::View { srv: true, data: vec![super::VIEW_MARK_NONE; 4] }),
-                        (2, Root::Uav(words)),
+                        // Direct heap indices are remapped through t255 before the view marks.
+                        (1, Root::View { srv: true, data: super::host::metadata_from_strides(&[0, 0]) }),
+                        (2, Root::View { srv: true, data: vec![super::VIEW_MARK_NONE; 4] }),
+                        (3, Root::Uav(words)),
                     ],
                     views: &[View::Texture(1, 1, &texel), View::Texture(1, 1, &texel)],
                     samplers: &[],
