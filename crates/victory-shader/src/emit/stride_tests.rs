@@ -535,6 +535,70 @@ fn a_half_buffer_load_through_structured_srv_reads_the_half_at_its_address() {
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
 
+/// An indexed sub-dword load selects the element before extracting its field.
+#[test]
+fn a_half_buffer_load_by_index_reads_the_structured_element() {
+    let mut code = HALF_LOAD_WAVE32.to_vec();
+    // buffer_load_ushort v2, v0, s[8:11], 0 idxen offset:6.
+    code[10] = 0xE028_2006;
+    code[11] = 0x8002_0200;
+    let shader = build(
+        &code,
+        vec![param(RootType::Table, 0), param(RootType::Table, 2)],
+        vec![
+            UsedResource { stride: 12, ..entry(ResourceType::Srv, 4, 0) },
+            entry(ResourceType::Uav, 4, 2),
+        ],
+        32,
+    );
+    // Each 12-byte element has its distinct field in bytes 6 and 7.
+    let half = |l: u32| 0x8000 + 3 * l;
+    let data: Vec<u32> = (0..32)
+        .flat_map(|l| [0xdeadbeef, (half(l) << 16) | 0x1234, 0xabcdef01])
+        .collect();
+    let views = [
+        View::Buffer {
+            data: &data,
+            stride: Stride::Structured(12),
+        },
+        View::RawUav(32),
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            // The SRV's table at heap index 0, the UAV's at 1.
+            ud[u.index as usize] = if u.slot == 0 { 0 } else { 32 };
+        }
+        let words = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        let want: Vec<u32> = (0..32).map(half).collect();
+        assert_eq!(words[0], want, "{label}");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
 /// `buffer_store_short`: each lane's half lands at its byte address and
 /// leaves the other half of the dword alone.
 #[test]
