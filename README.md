@@ -48,10 +48,10 @@ What each part does today and what it still needs:
 
 ## NVIDIA compatibility progress (2026-11-25)
 
-**80% of the five original regression failures resolved (4/5).** This is
+**100% of the five original regression failures resolved (5/5).** This is
 a test-fix milestone, not a percentage of game compatibility or playability.
 
-`[████████░░] 80%`
+`[██████████] 100%`
 
 Development branch: [fix/nvidia-compatibility](https://github.com/caeragasv3893-prog/VIctory/tree/fix/nvidia-compatibility).
 Test machine: Windows, NVIDIA GeForce RTX 5060 Ti (8 GB), driver 610.88.
@@ -62,17 +62,20 @@ Test machine: Windows, NVIDIA GeForce RTX 5060 Ti (8 GB), driver 610.88.
 | Dynamic descriptor slots | 100% | Regression passed |
 | Null buffer descriptors | 100% | Regression passed |
 | Texture gather | 100% | Targeted gather tests passed after matching structured SRV loads to their descriptors |
-| Runtime-selected buffer stride | Pending validation | Raw companion SRV implementation published; original structured view retained |
+| Runtime-selected buffer stride | 100% | Workspace regression run reported passing with raw companion SRVs; original structured view retained |
 
 ### Test results
 
 | Test suite | Baseline (passed / failed / ignored) | Latest confirmed result |
 |------------|--------------------------------------|-------------------------|
-| `victory-gpu` | 141 / 2 / 2 | 143 / 0 / 2, after the heap-limit change |
-| `victory-shader` | 244 / 3 / 3 | Targeted gather tests passed; full suite not yet rerun on the latest revision |
+| `victory-gpu` | 141 / 2 / 2 | Passed in latest workspace run; previously 143 / 0 / 2 after heap-limit change |
+| `victory-shader` | 244 / 3 / 3 | Passed in latest workspace run |
+| Full workspace | Initially stopped on GPU regressions | Passed (reported by the NVIDIA tester on 2026-11-25) |
 
-The latest runtime and shader changes still need a complete Windows build and
-regression run. The one-million-descriptor limit is experimental: title
+The NVIDIA tester reports that `cargo test --workspace --locked -- --test-threads=1`
+completed successfully after the raw companion SRV changes. Exact final test
+counts have not been supplied; no new totals are claimed. A fresh release build
+and title execution have not yet been validated. The one-million-descriptor limit is experimental: title
 descriptors beyond the host capacity still need a correct mapping strategy.
 Raw companion descriptors consume additional heap slots; their lifetime,
 capacity, and behaviour during real workloads need validation. The new
@@ -84,7 +87,8 @@ companion path covers SRV reads, not all UAV writes or typed buffer accesses.
 - [x] Reproduce and isolate the five original graphics test failures.
 - [x] Resolve the descriptor heap, dynamic slot, and null descriptor regressions.
 - [x] Validate the structured-buffer texture gather correction.
-- [ ] Validate raw companion SRVs and rerun all workspace tests.
+- [x] Validate raw companion SRVs and rerun all workspace tests (tester reported success).
+- [ ] Build and verify the updated release executable.
 - [ ] Verify descriptor capacity and resource lifetime under real title workloads.
 - [ ] Validate title boot, menus, world loading, and input on NVIDIA hardware.
 - [ ] Fix remaining world-rendering defects and profile frame times.
