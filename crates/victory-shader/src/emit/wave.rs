@@ -578,6 +578,117 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
     shapes(vec, uni, wave)
 }
 
+/// A bounded, ordered FP32 addition graph. The first 64 nodes are lane
+/// inputs; later nodes are binary adds in original operand order.
+pub(crate) struct OrderedSum {
+    pub adds: Vec<(usize, usize)>,
+    pub root: usize,
+}
+
+/// Independently replay the narrow full-EXEC sum subset without discarding
+/// floating-point association. Unsupported instructions or ambiguous
+/// results return None, leaving the old lowering and wave requirements.
+pub(crate) fn ordered_sum(
+    insts: &[Inst],
+    result: Value,
+    source: Value,
+    saved: Value,
+    identity: u32,
+) -> Option<OrderedSum> {
+    if insts.len() > 128 {
+        return None;
+    }
+    type Lanes = [Option<usize>; 64];
+    let mut values: HashMap<Value, Lanes> = HashMap::new();
+    let mut adds = Vec::new();
+    let mut intern = HashMap::new();
+    let imm = |op: &Operand| match *op {
+        Operand::Const(c) => crate::resource::inline(c),
+        Operand::Literal(x) => Some(x),
+        _ => None,
+    };
+    for inst in insts {
+        let Fields::Valu(v) = &inst.fields else { return None };
+        if v.abs != 0 || v.neg != 0 || v.clamp || v.omod != 0 || v.sdwa.is_some() {
+            return None;
+        }
+        let read = |op: &Operand| -> Option<Lanes> {
+            let reg = match *op {
+                Operand::Vector { reg, .. } => Reg::V(reg),
+                Operand::Scalar { code, .. } => Reg::S(code),
+                _ => return None,
+            };
+            values.get(&inst.read(reg)?).copied()
+        };
+        if inst.name() == "v_readlane_b32" {
+            if v.dpp.is_some() { return None; }
+            let Operand::Scalar { code, .. } = v.dst? else { return None };
+            let lane = usize::try_from(imm(v.src.get(1)?)?).ok()?;
+            let node = *read(v.src.first()?)?.get(lane)?;
+            values.insert(inst.write(Reg::S(code))?, [node; 64]);
+            continue;
+        }
+        let Operand::Vector { reg, .. } = v.dst? else { return None };
+        let dst = inst.write(Reg::V(reg))?;
+        let lanes = if inst.name() == "v_cndmask_b32" {
+            if v.dpp.is_some() || imm(v.src.first()?)? != identity {
+                return None;
+            }
+            let Operand::Vector { reg, .. } = *v.src.get(1)? else { return None };
+            let Operand::Scalar { code, .. } = *v.src.get(2)? else { return None };
+            if inst.read(Reg::V(reg))? != source || inst.read(Reg::S(code))? != saved {
+                return None;
+            }
+            std::array::from_fn(Some)
+        } else {
+            let a = read(v.src.first()?)?;
+            let b = match inst.name() {
+                "v_mov_b32" => None,
+                "v_add_f32" => Some(read(v.src.get(1)?)?),
+                _ => return None,
+            };
+            let old = inst.read(Reg::V(reg)).and_then(|x| values.get(&x).copied());
+            let mut lanes = [None; 64];
+            for (lane, out) in lanes.iter_mut().enumerate() {
+                let from = if let Some(dpp) = v.dpp {
+                    let (from, zero, writes) = dpp_lane(dpp, lane as u32)?;
+                    if !writes {
+                        *out = old?[lane];
+                        continue;
+                    }
+                    if zero { return None; }
+                    from as usize
+                } else {
+                    lane
+                };
+                let lhs = *a.get(from)?;
+                *out = if let Some(b) = b {
+                    match (lhs, b[lane]) {
+                        (Some(lhs), Some(rhs)) => {
+                            let key = (lhs, rhs);
+                            let node = *intern.entry(key).or_insert_with(|| {
+                                let node = 64 + adds.len();
+                                adds.push(key);
+                                node
+                            });
+                            Some(node)
+                        }
+                        _ => None,
+                    }
+                } else { lhs };
+            }
+            lanes
+        };
+        values.insert(dst, lanes);
+    }
+    let lanes = values.get(&result)?;
+    let root = lanes[0]?;
+    if root < 64 || !lanes.iter().all(|&n| n == Some(root)) {
+        return None;
+    }
+    Some(OrderedSum { adds, root })
+}
+
 fn constant(inst: &Inst) -> Option<u64> {
     let Fields::Sop { src, .. } = &inst.fields else {
         return None;
