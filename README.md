@@ -822,8 +822,13 @@ a native scan; it is a correctness-first implementation.
 The synthetic regression uses two logical waves, cross-row propagation,
 rounding-sensitive values, signed zeros, infinities and NaNs. It checks
 unrestricted DXIL wave bounds and compares each lane to a CPU reference
-on hardware and WARP when available. Compilation, strict Clippy, DXIL
-validation and execution of this new test are pending. Exclusive FP32
+on hardware and WARP when available. Windows validation at revision
+`0b0d75e` passed all twelve targeted wave64 tests in 3.44 s, including
+this regression on both hardware and WARP. Strict Clippy reported one
+assign-op-pattern lint in the CPU reference, not the translator. Revision
+`971e9ec` adds a local lint exception to preserve the operand order;
+strict Clippy revalidation and full workspace tests remain pending.
+Exclusive FP32
 prefixes, general divergent sections, FP16 and performance remain open.
 No AMD hardware or title execution validation is implied.
 
