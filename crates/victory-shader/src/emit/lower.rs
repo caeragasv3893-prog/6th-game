@@ -524,6 +524,11 @@ fn portable_reduction_section(x: &Parts<'_>) -> bool {
                             && super::wave::ordered_sum(inside, v, *src, saved, *ident).is_some() => {
                         live = true;
                     }
+                    Some(Shape::Prefix(Op::AddF, src, mask, ident, true))
+                        if *mask == saved && !defined.contains(src)
+                            && super::wave::ordered_prefix(inside, v, *src, saved, *ident).is_some() => {
+                        live = true;
+                    }
                     Some(Shape::Prefix(Op::AddU, src, mask, 0, _))
                         if *mask == saved && !defined.contains(src) => {
                         live = true;
@@ -1253,6 +1258,15 @@ impl<'a> Lower<'a> {
                             &self.x.p.blocks[b].insts[start + 1..end], w, src, mask, ident,
                         );
                         tree.ok_or("an unrecognized ordered FP32 sum")
+                            .and_then(|tree| self.portable_ordered_sum(src, tree))
+                    }
+                    Some(super::wave::Shape::Prefix(super::wave::Op::AddF, src, mask, ident, true))
+                        if self.portable_lanes => {
+                        let end = self.sections[&b][&start].end;
+                        let tree = super::wave::ordered_prefix(
+                            &self.x.p.blocks[b].insts[start + 1..end], w, src, mask, ident,
+                        );
+                        tree.ok_or("an unrecognized ordered FP32 prefix")
                             .and_then(|tree| self.portable_ordered_sum(src, tree))
                     }
                     _ => shape.ok_or(UNKNOWN).and_then(|sh| self.shape(sh)),
@@ -2099,7 +2113,9 @@ impl<'a> Lower<'a> {
         let own = self.s.m.element(c, lds, flat);
         let mode = self.s.m.i32(1 | 8);
         let mut needed = vec![false; 64 + tree.adds.len()];
-        needed[tree.root] = true;
+        for &root in &tree.roots {
+            needed[root] = true;
+        }
         for (i, &(a, b)) in tree.adds.iter().enumerate().rev() {
             if needed[64 + i] {
                 needed[a] = true;
@@ -2126,7 +2142,18 @@ impl<'a> Lower<'a> {
                 values[64 + i] = Some(self.s.m.bin(c, Bin::Add, lhs, rhs));
             }
         }
-        Ok(self.as_int(values[tree.root].expect("reachable sum result")))
+        let mut result = values[tree.roots[0]].expect("reachable sum result");
+        if !tree.roots.iter().all(|&root| root == tree.roots[0]) {
+            let mask = self.s.m.i32(63);
+            let logical = self.s.m.bin(c, Bin::And, flat, mask);
+            for (lane, &root) in tree.roots.iter().enumerate().skip(1) {
+                let index = self.s.m.i32(lane as u32);
+                let on = self.s.m.cmp(c, pred::EQ, logical, index);
+                let x = values[root].expect("reachable prefix result");
+                result = self.s.m.select(c, on, x, result);
+            }
+        }
+        Ok(self.as_int(result))
     }
 
     /// Fixed butterfly over the logical wave. Use the normal FP extrema
