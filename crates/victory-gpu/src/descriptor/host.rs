@@ -505,10 +505,13 @@ impl HostHeap {
     /// structured original for shaders that use it as structured.
     fn raw_srv_alias(&self, index: u32, buffer: &ID3D12Resource, first: u64, bytes: u64) -> u32 {
         let null = victory_shader::emit::NULL_BUFFER_VIEW;
-        if !first.is_multiple_of(16) || bytes == 0 || !bytes.is_multiple_of(4) {
+        let prefix = first % 16;
+        let Some(length) = bytes.checked_add(prefix).filter(|_| {
+            first.is_multiple_of(4) && bytes != 0 && bytes.is_multiple_of(4)
+        }) else {
             self.clear_raw_srv_alias(index);
             return null;
-        }
+        };
         let mut aliases = self.raw_aliases.lock().unwrap_or_else(|e| e.into_inner());
         let alias = if let Some(&alias) = aliases.slots.get(&index) {
             alias
@@ -526,7 +529,7 @@ impl HostHeap {
             aliases.slots.insert(index, alias);
             alias
         };
-        self.raw_view_at(alias, Some(buffer), first, bytes, false);
+        self.raw_view_at(alias, Some(buffer), first - prefix, length, false);
         alias
     }
 
@@ -747,7 +750,9 @@ impl HostHeap {
             let packed = match (raw, kept.as_ref().and_then(|k| k.as_ref())) {
                 (Some((first, bytes)), Some((buffer, _))) => {
                     let alias = self.raw_srv_alias(index, buffer, first, bytes);
-                    stride | ((alias + 1) << 12)
+                    // Structured strides are multiples of four. Their two low
+                    // bits carry the dword offset from the aligned raw SRV.
+                    stride | ((first % 16 / 4) as u32) | ((alias + 1) << 12)
                 }
                 _ => {
                     self.clear_raw_srv_alias(index);
@@ -911,22 +916,24 @@ fn write_address(data: usize, index: usize, view: Option<&View>) {
 /// The title memory a buffer shader or unordered access view reads: its
 /// address and length.
 pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
-    let (base, words): (u64, &[u32; 10]) = match view {
-        View::Shader(r, Some(desc)) => (
-            crate::resource::buffer_bytes(*r as crate::object::This)?.0 as u64,
-            desc,
-        ),
+    let (base, width, words): (u64, u64, &[u32; 10]) = match view {
+        View::Shader(r, Some(desc)) => {
+            let (address, width) = crate::resource::buffer_bytes(*r as crate::object::This)?;
+            (address as u64, width, desc)
+        }
         View::Placed(false, resource, desc) if resource[0] == 1 => (
             u64::from(desc[10]) | u64::from(desc[11]) << 32,
+            u64::from(resource[4]) | u64::from(resource[5]) << 32,
             desc[..10].try_into().ok()?,
         ),
         View::Unordered(r, _, Some(desc)) => {
-            let base = crate::resource::buffer_bytes(*r as crate::object::This)?.0 as u64;
-            return unordered_range(base, desc);
+            let (address, width) = crate::resource::buffer_bytes(*r as crate::object::This)?;
+            return unordered_range(address as u64, width, desc);
         }
         View::Placed(true, resource, desc) if resource[0] == 1 => {
             let base = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-            return unordered_range(base, desc[..10].try_into().ok()?);
+            let width = u64::from(resource[4]) | u64::from(resource[5]) << 32;
+            return unordered_range(base, width, desc[..10].try_into().ok()?);
         }
         _ => return None,
     };
@@ -934,10 +941,7 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
     let element = element_size(&desc);
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { desc.Anonymous.Buffer };
-    Some((
-        base + buffer.FirstElement * element,
-        u64::from(buffer.NumElements) * element,
-    ))
+    element_range(base, width, buffer.FirstElement, buffer.NumElements, element)
 }
 
 /// The host copy a buffer view's bytes are in (the one its host view
@@ -949,7 +953,7 @@ pub(crate) fn view_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::Sh
 }
 
 /// [`buffer_range`] of an unordered access view of memory at `base`.
-fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
+fn unordered_range(base: u64, width: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
     let desc = uav_desc(words);
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { desc.Anonymous.Buffer };
@@ -960,10 +964,7 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
     } else {
         crate::resource::element(desc.Format.0 as u32)?.0
     };
-    Some((
-        base + buffer.FirstElement * element,
-        u64::from(buffer.NumElements) * element,
-    ))
+    element_range(base, width, buffer.FirstElement, buffer.NumElements, element)
 }
 
 /// The host resource a slot made by [`make`] views, if any, and the view's
@@ -989,9 +990,8 @@ fn buffer_srv(
         return None;
     }
     // The copy its own bytes are in, its first element counted from there.
-    let start = address + buffer.FirstElement * element;
-    let Some((shadow, own)) =
-        crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)
+    let (start, bytes) = element_range(address, len, buffer.FirstElement, buffer.NumElements, element)?;
+    let Some((shadow, own)) = crate::shadow::for_view(start, bytes, element)
     else {
         #[cfg(feature = "diagnostics")]
         if REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
@@ -1039,7 +1039,19 @@ fn raw_range_valid(width: u64, first: u64, bytes: u64) -> bool {
 }
 
 fn within(width: u64, first: u64, count: u32, element: u64) -> bool {
-    count > 0 && first.saturating_add(u64::from(count)).saturating_mul(element) <= width
+    element_range(0, width, first, count, element).is_some()
+}
+
+/// Validate the title resource's extent before looking up or allocating a host copy.
+fn element_range(base: u64, width: u64, first: u64, count: u32, element: u64) -> Option<(u64, u64)> {
+    let offset = first.checked_mul(element)?;
+    let bytes = u64::from(count).checked_mul(element)?;
+    let end = offset.checked_add(bytes)?;
+    if bytes == 0 || end > width {
+        return None;
+    }
+    base.checked_add(end)?;
+    Some((base + offset, bytes))
 }
 
 /// An unordered access view of title buffer memory at `address` (`len`
@@ -1066,8 +1078,8 @@ fn buffer_uav(
         once!(len, "unordered buffer view of elements without a size");
         return None;
     }
-    let start = address + buffer.FirstElement * element;
-    let (shadow, own) = crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)?;
+    let (start, bytes) = element_range(address, len, buffer.FirstElement, buffer.NumElements, element)?;
+    let (shadow, own) = crate::shadow::for_view(start, bytes, element)?;
     // SAFETY: a live buffer.
     let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
     if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
@@ -1559,11 +1571,52 @@ mod tests {
         let first = heap.raw_srv_alias(0, &buffer, 0, 64);
         let second = heap.raw_srv_alias(1, &buffer, 0, 64);
         assert_eq!(second, first + 1);
-        assert_eq!(heap.raw_srv_alias(0, &buffer, 16, 48), first);
+        for offset in [4, 8, 12, 16] {
+            assert_eq!(heap.raw_srv_alias(0, &buffer, offset, 64 - offset), first);
+        }
+        assert_eq!(heap.raw_srv_alias(0, &buffer, 2, 4), victory_shader::emit::NULL_BUFFER_VIEW);
         heap.clear_raw_srv_alias(0);
         assert_eq!(heap.raw_srv_alias(0, &buffer, 0, 64), first);
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    #[test]
+    fn structured_srv_rewrites_publish_the_raw_companion_offset() {
+        let Some(heap) = HostHeap::new(false, 1) else {
+            eprintln!("no host descriptor heap; skipped");
+            return;
+        };
+        let mut backing = [0u32; 32];
+        let address = backing.as_mut_ptr() as u64;
+        let width = size_of_val(&backing) as u32;
+        crate::shadow::register(address as usize, address, u64::from(width));
+        let mut resource = [0u32; 14];
+        resource[0] = 1;
+        resource[4] = width;
+        let mut record = [0u32; 8];
+        let handle = record.as_mut_ptr() as u64;
+        let (_, metadata) = heap.strides.as_ref().unwrap();
+        let mut previous = None;
+        for first in [1, 2, 3, 4] {
+            let mut desc = [0u32; 16];
+            desc[..10].copy_from_slice(&[0, 1, 5768, 0, first, 0, 2, 12, 0, 0]);
+            desc[10] = address as u32;
+            desc[11] = (address >> 32) as u32;
+            let view = View::Placed(false, resource, desc);
+            super::super::record(handle, view.clone());
+            assert_eq!(heap.mirror(0, handle, false), Some(view));
+            // SAFETY: the heap owns this mapped stride entry for slot zero.
+            let packed = unsafe { (*metadata as *const u32).add(VIEW_STRIDE_BASE as usize).read_volatile() };
+            assert_eq!(packed & 0xFFF, 12 | ((first * 12 % 16) / 4));
+            let alias = (packed >> 12).checked_sub(1).expect("raw companion");
+            assert_ne!(alias, victory_shader::emit::NULL_BUFFER_VIEW);
+            if let Some(old) = previous.replace(alias) {
+                assert_eq!(old, alias);
+            }
+        }
+        drop(heap);
+        crate::shadow::unregister(address as usize, address);
     }
 
     #[test]
@@ -1665,6 +1718,9 @@ mod tests {
         assert!(!within(64, 0, 0, 16));
         assert!(!within(64, 3, 2, 16));
         assert!(!within(64, u64::MAX, 1, 16));
+        assert!(!within(u64::MAX, u64::MAX, 1, 4));
+        assert!(element_range(u64::MAX - 15, 16, 0, 4, 4).is_none());
+        assert_eq!(element_range(32, 64, 3, 1, 16), Some((80, 16)));
     }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's

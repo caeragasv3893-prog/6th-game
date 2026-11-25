@@ -204,6 +204,8 @@ struct Lower<'a> {
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
     handles: HashMap<HandleKey, V>,
+    /// Byte displacement inside the aligned raw SRV for a heap handle.
+    raw_prefix: HashMap<V, V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -611,6 +613,7 @@ impl<'a> Lower<'a> {
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
             handles: HashMap::new(),
+            raw_prefix: HashMap::new(),
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
@@ -1716,6 +1719,21 @@ impl<'a> Lower<'a> {
             let off = match self.root_view_offset(src) {
                 Some(at) => self.s.m.bin(self.cur, Bin::Add, off, at),
                 None => off,
+            };
+            let off = if let Some(&prefix) = self.raw_prefix.get(&h) {
+                let c = self.cur;
+                let sum = self.s.m.bin(c, Bin::Add, off, prefix);
+                // Leave room for subsequent component loads. An address in
+                // this range already exceeds the 512 MiB raw companion.
+                let last = self.s.m.i32(u32::MAX - bytes - 16);
+                let high = self.s.m.cmp(c, pred::IUGT, off, last);
+                let zero = self.s.m.i32(0);
+                let shifted = self.s.m.cmp(c, pred::NE, prefix, zero);
+                let overflow = self.s.m.bin(c, Bin::And, shifted, high);
+                let outside = self.s.m.i32(1 << 30);
+                self.s.m.select(c, overflow, outside, sum)
+            } else {
+                off
             };
             return Ok((h, off));
         };
@@ -4349,7 +4367,10 @@ impl<'a> Lower<'a> {
     fn stride_at(&mut self, index: V) -> V {
         let packed = self.packed_stride(index);
         let c = self.cur;
-        let mask = self.s.m.i32(0xFFF);
+        let plain_mask = self.s.m.i32(0xFFF);
+        let structured_mask = self.s.m.i32(0xFFC);
+        let companion = self.s.m.cmp(c, pred::IUGT, packed, plain_mask);
+        let mask = self.s.m.select(c, companion, structured_mask, plain_mask);
         self.s.m.bin(c, Bin::And, packed, mask)
     }
 
@@ -4901,13 +4922,10 @@ impl<'a> Lower<'a> {
                     return Ok(h);
                 }
                 let index = self.heap_index(*load, *first, sampler)?;
-                let index = self.buffer_guard(src, index, sampler, props);
                 // A waterfall loop's load at the first lane's offset reads
                 // each lane's own entry (see `resource::Waterfall`).
                 let per_lane = self.x.res.waterfall.loads.contains(load);
-                let h = self
-                    .s
-                    .heap_handle(self.cur, index, sampler, per_lane, props);
+                let h = self.guarded_handle(src, index, sampler, per_lane, props);
                 self.handles.insert(key, h);
                 Ok(h)
             }
@@ -5022,8 +5040,7 @@ impl<'a> Lower<'a> {
                 let join = self.block[*block].ok_or("a descriptor chosen by control flow")?;
                 let phi = self.s.m.phi(join, self.s.t.i32);
                 self.s.m.set_phi(phi, incoming);
-                let index = self.buffer_guard(src, phi, sampler, props);
-                Ok(self.s.heap_handle(self.cur, index, sampler, false, props))
+                Ok(self.guarded_handle(src, phi, sampler, false, props))
             }
             Source::Select { scc, args } => {
                 // The heap index of each choice, picked by SCC (uniform).
@@ -5041,16 +5058,14 @@ impl<'a> Lower<'a> {
                 let set = self.heap_index(a, fa, sampler)?;
                 let clear = self.heap_index(b, fb, sampler)?;
                 let index = self.s.m.select(self.cur, cond, set, clear);
-                let index = self.buffer_guard(src, index, sampler, props);
-                Ok(self.s.heap_handle(self.cur, index, sampler, false, props))
+                Ok(self.guarded_handle(src, index, sampler, false, props))
             }
             Source::Fetched { .. } | Source::Lanes { .. } | Source::LanePhi { .. } => {
                 // A descriptor each lane has its own of (a waterfall loop
                 // reads it from the first active lane): each lane's heap
                 // index, non-uniform.
                 let index = self.lane_heap_index(src, sampler)?;
-                let index = self.buffer_guard(src, index, sampler, props);
-                Ok(self.s.heap_handle(self.cur, index, sampler, true, props))
+                Ok(self.guarded_handle(src, index, sampler, true, props))
             }
         }
     }
@@ -5062,10 +5077,10 @@ impl<'a> Lower<'a> {
     /// from data; one naming a texture slot read a texture descriptor as a
     /// buffer one (a wild address: the texture's address shifted 8 bits
     /// down) and faulted the device.
-    fn buffer_guard(&mut self, src: &Source, index: V, sampler: bool, props: (u32, u32)) -> V {
+    fn guarded_handle(&mut self, src: &Source, index: V, sampler: bool, per_lane: bool, props: (u32, u32)) -> V {
         // Typed, raw and structured buffers (DXIL resource kinds 10-12).
         if sampler || !(10..=12).contains(&(props.0 & 0xFF)) || !self.is_heap_direct(src) {
-            return index;
+            return self.s.heap_handle(self.cur, index, sampler, per_lane, props);
         }
         let c = self.cur;
         let last = self.s.m.i32(super::HEAP_VIEWS - 1);
@@ -5078,20 +5093,30 @@ impl<'a> Lower<'a> {
         let none = self.s.m.cmp(c, pred::EQ, stride, zero);
         // A raw SRV access to a structured view uses its raw companion.
         // High 20 bits encode its index plus one (zero: original slot).
-        let index = if props.0 & 0x10FF == 11 {
+        let (index, prefix) = if props.0 & 0x10FF == 11 {
             let shift = self.s.m.i32(12);
             let alias = self.s.m.bin(c, Bin::LShr, packed, shift);
             let has_alias = self.s.m.cmp(c, pred::NE, alias, zero);
             let one = self.s.m.i32(1);
             let alias = self.s.m.bin(c, Bin::Sub, alias, one);
-            self.s.m.select(c, has_alias, alias, index)
+            let three = self.s.m.i32(3);
+            let four = self.s.m.i32(4);
+            let words = self.s.m.bin(c, Bin::And, packed, three);
+            let bytes = self.s.m.bin(c, Bin::Mul, words, four);
+            let prefix = self.s.m.select(c, has_alias, bytes, zero);
+            (self.s.m.select(c, has_alias, alias, index), Some(prefix))
         } else {
-            index
+            (index, None)
         };
         // The null unordered access view sits just below the null SRV.
         let null = super::NULL_BUFFER_VIEW - u32::from(props.0 & 0x1000 != 0);
         let null = self.s.m.i32(null);
-        self.s.m.select(c, none, null, index)
+        let index = self.s.m.select(c, none, null, index);
+        let handle = self.s.heap_handle(c, index, sampler, per_lane, props);
+        if let Some(prefix) = prefix {
+            self.raw_prefix.insert(handle, prefix);
+        }
+        handle
     }
 
     /// Whether a descriptor comes from the resource heap itself (root type

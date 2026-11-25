@@ -248,17 +248,8 @@ fn a_heap_buffer_read_by_element_takes_the_views_stride() {
         32,
     );
     assert_eq!(shader.root_srvs, [VIEW_STRIDES]);
-    // 32 elements of 12 bytes: (100 + e, 200 + e, 300 + e).
-    let data: Vec<u32> = (0..32).flat_map(|e| [100 + e, 200 + e, 300 + e]).collect();
-    let views = [
-        View::RawUav(32),
-        View::Buffer {
-            data: &data,
-            stride: Stride::Structured(12),
-        },
-        // The same bytes through the host's raw companion descriptor.
-        View::Buffer { data: &data, stride: Stride::Raw },
-    ];
+    // Lane 31 reads beyond the last element.
+    let data: Vec<u32> = (0..31).flat_map(|e| [100 + e, 200 + e, 300 + e]).collect();
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -281,31 +272,29 @@ fn a_heap_buffer_read_by_element_takes_the_views_stride() {
                 other => panic!("unexpected user data {other:?}"),
             };
         }
-        let words = host
-            .dispatch(
-                &root,
-                &pso,
-                &Dispatch {
-                    // User data, then the stride table: heap index 1 holds
-                    // 12-byte elements.
-                    roots: vec![
-                        (0, Root::Constants(ud)),
-                        (
-                            1,
-                            Root::View {
-                                srv: true,
-                                data: view_metadata(&[4, 12 | (3 << 12), 4], 2, &[0, 1]),
-                            },
-                        ),
-                    ],
-                    views: &views,
-                    samplers: &[],
-                    groups: [1, 1, 1],
-                },
-            )
-            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
-        let want: Vec<u32> = (0..32).map(|l| 200 + l).collect();
-        assert_eq!(words[0], want, "{label}");
+        for prefix in 0..4 {
+            let mut raw = vec![0xdeadbeef; prefix];
+            raw.extend_from_slice(&data);
+            let views = [
+                View::RawUav(32),
+                View::Buffer { data: &data, stride: Stride::Structured(12) },
+                View::Buffer { data: &raw, stride: Stride::Raw },
+            ];
+            let packed = 12 | prefix as u32 | (3 << 12);
+            let dispatch = Dispatch {
+                roots: vec![
+                    (0, Root::Constants(ud.clone())),
+                    (1, Root::View { srv: true, data: view_metadata(&[4, packed, 4], 2, &[0, 1]) }),
+                ],
+                views: &views,
+                samplers: &[],
+                groups: [1, 1, 1],
+            };
+            let words = host.dispatch(&root, &pso, &dispatch)
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            let want: Vec<u32> = (200..231).chain([0]).collect();
+            assert_eq!(words[0], want, "{label}, {prefix} prefix dwords");
+        }
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");

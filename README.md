@@ -105,9 +105,9 @@ standard features in 6.49 s and all features in 6.77 s.
 | CPU snapshot memory | Configurable idle snapshot pool limit, budget-aware trimming and periodic logging | PASS on revision `571cf65`: both targeted pool tests and strict all-features Clippy (2.23 s) |
 | Additional shader coverage and rendering performance | Not implemented | Pending measured baseline |
 
-Unaligned raw companion offsets use a null buffer view. Supporting these
-offsets requires an aligned copy or explicit shader offset handling. Companion
-slots remain reserved for the lifetime of the heap to avoid premature reuse.
+At this stage, unaligned raw companion offsets used a null buffer view. The
+later structured SRV change below covers dword-aligned offsets. Companion
+slots stay reserved for the lifetime of the heap.
 
 The release-mode descriptor benchmark passed on the NVIDIA test machine at
 revision `f76c2b9`. Its workload is 100,000 sequential allocations and
@@ -182,6 +182,51 @@ cargo test -p victory-gpu --lib --locked oversized_view_heap -- --nocapture
 cargo test -p victory-shader --lib --locked a_heap_buffer_read -- --test-threads=1 --nocapture
 cargo build --profile diag -p victory --features diagnostics --locked
 ```
+
+### Structured buffer reads at unaligned raw SRV offsets (2026-11-25)
+
+A structured buffer can start 4, 8, or 12 bytes past the 16-byte boundary
+required by a D3D12 raw SRV. The runtime now places its raw companion at the
+preceding boundary on the same GPU buffer. The heap metadata records the
+displacement in dwords. Translated direct-heap raw SRV loads add it to the
+byte address and preserve the original element stride. Rewriting a descriptor
+updates the displacement while retaining its companion slot.
+
+Both shader-resource and unordered-access buffer descriptors now check the
+first element, byte extent, and address arithmetic against the declared title
+resource before looking up a host copy. This also catches views that would
+fit only because the host allocation was rounded up. The raw companion path
+requires a whole number of dwords. Its 512 MiB physical view limit includes
+the alignment prefix.
+
+| Regression check | Observed result |
+|------------------|-----------------|
+| Host descriptor rewrites | Four successive structured views publish displacements of 12, 8, 4, and 0 bytes in the same companion slot |
+| Translated shader on hardware and WARP | For all four alignments, 31 lanes read the expected field from 12-byte elements and the final lane (index 31) reads zero beyond the view |
+| Range boundaries | A view ending exactly at the resource boundary is accepted. Empty, out-of-range, and overflowing extents are rejected |
+
+```powershell
+cargo test -p victory-gpu --lib --locked structured_srv_rewrites -- --nocapture
+cargo test -p victory-shader --lib --locked a_heap_buffer_read -- --test-threads=1 --nocapture
+cargo test --workspace --all-features --locked -- --test-threads=1
+cargo test --release --locked -p victory-gpu -p victory-shader -p victory-formats --lib -- --ignored --test-threads=1 --nocapture --skip reference_chunks --skip walks_saved_streams --skip matches_a_reference_decoder --skip defect_multiply_adds_fused_only_where_the_host_fuses
+```
+
+Local Windows validation on the RTX 5060 Ti test machine:
+
+| Check | Result |
+|-------|--------|
+| Default workspace tests and doctests | 710 passed, 0 failed, 11 ignored |
+| Workspace with all features and doctests | 715 passed, 0 failed, 11 ignored |
+| Strict workspace Clippy, all targets | Passed with default features and with all features |
+| Builds | Workspace debug, release executable, and diagnostics executable passed |
+| Configuration smoke test | Release and diagnostics executables read the example configuration with an absent game directory |
+
+Each workspace total counts the nested HLE child test once. The release
+benchmark run passed all seven synthetic benchmarks. For the CPU
+descriptor allocator, 100,000 allocation/release cycles took 3.0081 ms in
+this run. The three reference-data tests require external fixtures. The
+separate fused multiply-add test remains a known host-dependent shader issue.
 
 ### Development roadmap
 
