@@ -148,6 +148,17 @@ fn first(u: f32, size: u32) -> i64 {
 
 #[test]
 fn gathers_at_a_level_match_the_hardware() {
+    check_gathers_at_a_level(Stride::Structured(16));
+}
+
+// Diagnostic: isolate the gather lowering from a raw shader load through
+// a structured descriptor, which is not portable across host adapters.
+#[test]
+fn gathers_at_a_level_with_raw_input() {
+    check_gathers_at_a_level(Stride::Raw);
+}
+
+fn check_gathers_at_a_level(input_stride: Stride) {
     // 24×16 then 12×8, 6×4, 3×2; red = level × 1000 + y × 32 + x + 1.
     let mut texels = Vec::new();
     for l in 0..4 {
@@ -209,7 +220,7 @@ fn gathers_at_a_level_match_the_hardware() {
         View::Mipped(24, 16, 4, &texels),
         View::Buffer {
             data: &input,
-            stride: Stride::Structured(16),
+            stride: input_stride,
         },
         View::RawUav(32 * 12),
     ];
