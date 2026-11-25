@@ -1275,7 +1275,7 @@ pub fn view_strides(views: &[View]) -> Vec<u32> {
         | DXGI_FORMAT_R8G8_SINT | DXGI_FORMAT_R16_SINT | DXGI_FORMAT_R8_SINT => super::VIEW_INTEGER | super::VIEW_SIGNED,
         _ => 0,
     };
-    views
+    let words: Vec<u32> = views
         .iter()
         .map(|v| match *v {
             View::Buffer { stride: Stride::Raw, .. } | View::RawUav(_) => 4,
@@ -1285,8 +1285,25 @@ pub fn view_strides(views: &[View]) -> Vec<u32> {
             View::HalfUav(_) => 8,
             _ => 0,
         })
-        .collect()
+        .collect();
+    metadata_from_strides(&words)
 }
+
+/// Build the portable metadata ABI from ordinary test view strides and
+/// integer format flags. The raw-companion tests build their packed
+/// stride plane separately.
+#[cfg(test)]
+pub fn metadata_from_strides(words: &[u32]) -> Vec<u32> {
+    let mut data = vec![0; super::VIEW_REMAP_SENTINEL as usize + 1];
+    assert!(words.len() <= super::HEAP_VIEWS as usize);
+    data[0] = words.len() as u32;
+    for (i, &word) in words.iter().enumerate() {
+        data[super::VIEW_STRIDE_BASE as usize + i] = word & super::VIEW_STRIDE_BITS;
+        data[super::VIEW_KIND_BASE as usize + i] = word & (super::VIEW_INTEGER | super::VIEW_SIGNED);
+    }
+    data
+}
+
 
 /// How [`View::Buffer`] is viewed.
 #[cfg(test)]
