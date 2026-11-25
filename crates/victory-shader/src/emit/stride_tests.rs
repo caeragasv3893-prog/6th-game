@@ -670,6 +670,65 @@ fn wave64_bpermute_exchanges_values_across_warps() {
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
 
+/// Reuse both LDS banks repeatedly, including absent sources in partial
+/// logical waves and multiple independent logical waves in one group.
+#[test]
+fn wave64_bpermute_ping_pong_bank_reuse() {
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        for threads in [1u32, 33, 63, 64, 65, 96, 128, 129, 256, 1024] {
+            let offsets = [1u32, 32, 0, 63, 17, 48, 1];
+            let mut words = vec![
+                0xBE84_0300, 0xBE85_0380,
+                0xF408_0202, 0xFA00_0000,
+                0x3404_0082, 0xBF8C_C07F,
+                0x7E06_0300, // v3 = v0
+            ];
+            let mut want: Vec<u32> = (0..threads).collect();
+            for offset in offsets {
+                words.extend([0xDACC_0000 | (offset * 4), 0x0300_0302, 0xBF8C_C07F]);
+                want = (0..threads)
+                    .map(|lane| {
+                        let src = (lane & !63) | ((lane + offset) & 63);
+                        want.get(src as usize).copied().unwrap_or(0)
+                    })
+                    .collect();
+            }
+            words.extend([0xE070_1000, 0x8002_0302, 0xBF81_0000]);
+            let shader = build_wave(
+                &words,
+                vec![param(RootType::Table, 0)],
+                vec![entry(ResourceType::Uav, 4, 0)],
+                threads,
+                true,
+            );
+            let (root, pso) = host.compute_pipeline(&shader).unwrap_or_else(
+                |e| panic!("{label}, {threads} threads: compute pipeline failed: {e}"),
+            );
+            let dispatch = Dispatch {
+                roots: vec![(0, Root::Constants(vec![0; shader.user_data_dwords().max(1) as usize]))],
+                views: &[View::RawUav(threads)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            };
+            for _ in 0..3 {
+                let out = host.dispatch(&root, &pso, &dispatch).unwrap_or_else(
+                    |e| panic!("{label}, {threads} threads: dispatch failed: {e}"),
+                );
+                assert_eq!(out[0], want, "{label}, {threads} threads");
+            }
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
 #[test]
 fn wave64_bpermute_group_uniform_branch_and_loop() {
     let words = [
