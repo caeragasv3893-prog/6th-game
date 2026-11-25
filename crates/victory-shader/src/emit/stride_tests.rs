@@ -1072,6 +1072,15 @@ fn wave64_recognized_integer_prefix_sums_cross_warps() {
 
 #[test]
 fn wave64_recognized_fp32_inclusive_prefix_preserves_association() {
+    check_fp32_prefix(true);
+}
+
+#[test]
+fn wave64_recognized_fp32_exclusive_prefix_preserves_association() {
+    check_fp32_prefix(false);
+}
+
+fn check_fp32_prefix(inclusive: bool) {
     use super::wave::{Op, Shape};
     let vop3 = |dst: u32, op: u32, a: u32, b: u32, c: u32| {
         [0xD400_0000 | (op << 16) | dst, a | (b << 9) | (c << 18)]
@@ -1105,8 +1114,20 @@ fn wave64_recognized_fp32_inclusive_prefix_preserves_association() {
     words.extend([0xBEFE_0380, 0xBEFF_03FF, 0x0000_FFFF, add(1, 20, 1)]);
     words.extend(vop3(20, 0x360, 257, 128 + 47, 0));
     words.extend([0xBEFE_0380, 0xBEFF_03FF, 0xFFFF_0000, add(1, 20, 1)]);
+    words.push(0xBEFE_04C1);
+    if !inclusive {
+        // Save cross-row predecessors before shifting within each row.
+        for (reg, lane) in [(20, 15), (21, 31), (22, 47)] {
+            words.extend(vop3(reg, 0x360, 257, 128 + lane, 0));
+        }
+        words.extend([0x7E02_02FA, 0xFF01_1101]); // v_mov_b32 v1, v1 row_shr:1
+        words.extend([0xBEFE_0481, 0x7E02_0280]); // lane 0 = +0
+        words.extend([0xBEFE_04FF, 0x0001_0000, 0x7E02_0214]); // lane 16 = s20
+        words.extend([0xBEFE_0380, 0xBEFF_0381, 0x7E02_0215]); // lane 32 = s21
+        words.extend([0xBEFF_03FF, 0x0001_0000, 0x7E02_0216]); // lane 48 = s22
+        words.push(0xBEFE_04C1);
+    }
     words.extend([
-        0xBEFE_04C1,
         0xBEFE_0418,
         0xE070_1000, 0x8004_0102,
         0xBF81_0000,
@@ -1115,8 +1136,8 @@ fn wave64_recognized_fp32_inclusive_prefix_preserves_association() {
     let p = ir::build(&code, true, 8).unwrap();
     assert!(super::wave::sections(&p, 0).values().any(|sec| {
         sec.shapes.values().any(|sh| matches!(sh,
-            Shape::Prefix(Op::AddF, _, _, 0, true)))
-    }), "inclusive FP32 prefix must be recognized");
+            Shape::Prefix(Op::AddF, _, _, 0, incl) if *incl == inclusive))
+    }), "FP32 prefix must be recognized (inclusive={inclusive})");
     let shader = build_wave(
         &words,
         vec![param(RootType::Table, 0), param(RootType::Table, 2)],
@@ -1186,7 +1207,11 @@ fn wave64_recognized_fp32_inclusive_prefix_preserves_association() {
                 },
             ).unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
             for base in [0usize, 64] {
-                let expected = reference(&input[base..base + 64]);
+                let mut expected = reference(&input[base..base + 64]);
+                if !inclusive {
+                    expected.rotate_right(1);
+                    expected[0] = 0.0;
+                }
                 for (lane, (&bits, want)) in out[0][base..base + 64].iter().zip(expected).enumerate() {
                     if want.is_nan() {
                         assert!(f32::from_bits(bits).is_nan(), "{label}: case {case}, lane {lane}");
@@ -1196,7 +1221,7 @@ fn wave64_recognized_fp32_inclusive_prefix_preserves_association() {
                 }
             }
         }
-        eprintln!("{label}: recognized ordered wave64 FP32 inclusive prefix passed");
+        eprintln!("{label}: recognized ordered wave64 FP32 prefix passed (inclusive={inclusive})");
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
