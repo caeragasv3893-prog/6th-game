@@ -406,6 +406,92 @@ fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
     })
 }
 
+/// Shared integer reduction operations preserve the console's 32-bit
+/// arithmetic and signedness. Floating-point association is not covered.
+fn integer_reduction_op(op: super::wave::Op) -> Option<super::bitcode::Rmw> {
+    use super::{bitcode::Rmw, wave::Op};
+    Some(match op {
+        Op::AddU => Rmw::Add,
+        Op::MinU => Rmw::UMin,
+        Op::MaxU => Rmw::UMax,
+        Op::MinI => Rmw::Min,
+        Op::MaxI => Rmw::Max,
+        Op::And => Rmw::And,
+        Op::Or => Rmw::Or,
+        Op::Xor => Rmw::Xor,
+        _ => return None,
+    })
+}
+
+/// Admit only a single, fully uniform recognized section, with pure
+/// integer instructions inside and ordinary lane-local setup/stores outside.
+/// All live section results must be recognized integer full-wave reductions.
+fn portable_reduction_section(x: &Parts<'_>) -> bool {
+    use super::wave::Shape;
+    if x.p.blocks.len() != 1
+        || !x.st.guards.iter().flatten().all(|g| g.is_none() || *g == Some(Bool::TRUE))
+    {
+        return false;
+    }
+    let block = &x.p.blocks[0];
+    let sections = super::wave::sections(x.p, 0);
+    if sections.len() != 1 {
+        return false;
+    }
+    let Some((&start, sec)) = sections.iter().next() else {
+        return false;
+    };
+    if block.insts[start].name() != "s_or_saveexec_b64"
+        || block.insts[sec.end].name() != "s_mov_b64"
+        || block.insts[sec.end].write(Reg::S(EXEC)).is_none()
+    {
+        return false;
+    }
+    let inside = &block.insts[start + 1..sec.end];
+    if !inside.iter().all(|i| {
+        matches!(&i.fields, Fields::Valu(_))
+            && matches!(i.name(), "v_cndmask_b32" | "v_mov_b32" | "v_readlane_b32"
+                | "v_permlanex16_b32" | "v_add_nc_u32" | "v_min_u32" | "v_max_u32"
+                | "v_min_i32" | "v_max_i32" | "v_and_b32" | "v_or_b32" | "v_xor_b32")
+            && i.writes.iter().all(|&(r, _)| matches!(r, Reg::V(_) | Reg::S(0..=103)))
+    }) {
+        return false;
+    }
+    let defined: HashSet<Value> = inside.iter().flat_map(|i| i.writes.iter().map(|w| w.1)).collect();
+    let mut live = false;
+    for (n, i) in block.insts.iter().enumerate() {
+        if n >= start && n <= sec.end {
+            continue;
+        }
+        if reads_mask_as_data(x.st, i) {
+            return false;
+        }
+        let ordinary = match i.name() {
+            "s_mov_b32" | "s_load_dwordx4" => i.writes.iter().all(
+                |&(r, _)| matches!(r, Reg::S(0..=103)),
+            ),
+            "v_mov_b32" | "v_lshlrev_b32" => matches!(&i.fields, Fields::Valu(v) if v.dpp.is_none()),
+            "s_waitcnt" | "s_endpgm" | "buffer_store_dword" => true,
+            _ => false,
+        };
+        if !ordinary {
+            return false;
+        }
+        for &(_, v) in &i.reads {
+            if defined.contains(&v) {
+                match sec.shapes.get(&v) {
+                    Some(Shape::Active(op, src, _, _))
+                        if integer_reduction_op(*op).is_some() && !defined.contains(src) => {
+                        live = true;
+                    }
+                    _ => return false,
+                }
+            }
+        }
+    }
+    live
+}
+
 /// Where half `h` (dword h / 2, the high half when odd) of the parameter
 /// whose first element is in row `a` comes from, when the console packs
 /// 16-bit values two per dword: a row and channel of `elements`, none for
@@ -539,7 +625,8 @@ impl<'a> Lower<'a> {
             // and ballots of unmasked integer compares. Scratch operations
             // require complete logical waves and no title LDS or guards:
             // every thread must reach both group barriers.
-            let scratch = insts().any(|i| {
+            let reduction = x.native.wave64 && portable_reduction_section(x);
+            let scratch = reduction || insts().any(|i| {
                 i.name() == "ds_bpermute_b32" || reads_mask_as_data(x.st, i)
             });
             let threads = cs.threads.iter().product::<u32>();
@@ -550,7 +637,7 @@ impl<'a> Lower<'a> {
                 && console_lanes
                 && s.lds_dwords == 0
                 && p.blocks.len() == 1
-                && insts().all(|i| {
+                && (reduction || insts().all(|i| {
                     if reads_mask_as_data(x.st, i)
                         && !matches!(i.name(), "v_mov_b32" | "s_bcnt1_i32_b64")
                     {
@@ -584,7 +671,7 @@ impl<'a> Lower<'a> {
                         "s_waitcnt" | "s_endpgm" | "buffer_store_dword" => true,
                         _ => false,
                     }
-                });
+                }));
             if portable_lanes && scratch {
                 // The entire group's scratch is private to this lowering.
                 // Reuse it only after all readers have reached the second barrier.
@@ -1226,6 +1313,10 @@ impl<'a> Lower<'a> {
         let x = self.i32_of(src)?;
         let id = self.s.m.i32(ident);
         let x = self.s.m.select(c, on, x, id);
+        if self.portable_lanes && prefix.is_none() {
+            let rmw = integer_reduction_op(op).ok_or("a portable non-integer reduction")?;
+            return Ok(self.portable_reduce(x, id, rmw));
+        }
         self.s.flags |= flags::WAVE_OPS;
         let float = matches!(op, Op::AddF | Op::MinF | Op::MaxF);
         let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
@@ -1892,6 +1983,26 @@ impl<'a> Lower<'a> {
         // A later ballot or bpermute must not overwrite a pending read.
         self.s.op(c, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[mode]);
         (lo, hi)
+    }
+
+    /// All logical-wave lanes contribute to one accumulator. Initialize
+    /// each private slot with the identity to avoid a divergent clear.
+    fn portable_reduce(&mut self, value: V, identity: V, op: super::bitcode::Rmw) -> V {
+        let c = self.cur;
+        let flat = self.mesh_thread();
+        let mask = self.s.m.i32(!63u32);
+        let base = self.s.m.bin(c, Bin::And, flat, mask);
+        let lds = self.s.lds();
+        let own = self.s.m.element(c, lds, flat);
+        let acc = self.s.m.element(c, lds, base);
+        let mode = self.s.m.i32(1 | 8);
+        self.s.m.store(c, own, identity);
+        self.s.op(c, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[mode]);
+        self.s.m.atomic(c, op, acc, value);
+        self.s.op(c, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[mode]);
+        let result = self.s.m.load(c, acc);
+        self.s.op(c, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[mode]);
+        result
     }
 
     /// Both dwords of a mask holding lanes that do not reach the block
