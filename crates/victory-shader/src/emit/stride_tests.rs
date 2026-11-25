@@ -978,6 +978,99 @@ fn wave64_recognized_integer_reductions_use_shared_accumulators() {
 }
 
 #[test]
+fn wave64_recognized_integer_prefix_sums_cross_warps() {
+    use super::wave::{Op, Shape};
+    let vop3 = |dst: u32, op: u32, a: u32, b: u32, c: u32| {
+        [0xD400_0000 | (op << 16) | dst, a | (b << 9) | (c << 18)]
+    };
+    let add = |dst: u32, a: u32, b: u32| {
+        (0x25 << 25) | (dst << 17) | (b << 9) | a
+    };
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    for inclusive in [true, false] {
+        let mut words = vec![
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202, 0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xBE98_25C1, // s_or_saveexec_b64 s[24:25], -1
+        ];
+        words.extend(vop3(1, 0x101, 128, 256, 24)); // masked source
+        words.push(0x7E0A_0301); // v_mov_b32 v5, v1 (original term)
+        for shift in [1u32, 2, 4, 8] {
+            words.push(add(1, 0xFA, 1));
+            words.push(0xFF00_0001 | ((0x110 + shift) << 8)); // row_shr
+        }
+        // Propagate each completed row total to the next row. These EXEC
+        // changes are simulated; they must not become divergent barriers.
+        words.extend(vop3(16, 0x360, 257, 128 + 15, 0));
+        words.extend([0xBEFE_04FF, 0xFFFF_0000, add(1, 16, 1)]);
+        words.extend(vop3(16, 0x360, 257, 128 + 31, 0));
+        words.extend([0xBEFE_0380, 0xBEFF_03FF, 0x0000_FFFF, add(1, 16, 1)]);
+        words.extend(vop3(16, 0x360, 257, 128 + 47, 0));
+        words.extend([0xBEFE_0380, 0xBEFF_03FF, 0xFFFF_0000, add(1, 16, 1)]);
+        words.push(0xBEFE_04C1); // EXEC = all lanes
+        if !inclusive {
+            // v_sub_nc_u32 v1, v1, v5 (remove the original term).
+            words.push((0x26 << 25) | (1 << 17) | (5 << 9) | 257);
+        }
+        words.extend([
+            0xBEFE_0418, // restore saved EXEC
+            0xE070_1000, 0x8002_0102, // buffer_store_dword v1, v2, s[8:11], 0 offen
+            0xBF81_0000,
+        ]);
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = ir::build(&code, true, 8).unwrap();
+        let sections = super::wave::sections(&p, 0);
+        assert!(sections.values().any(|sec| sec.shapes.values().any(
+            |sh| matches!(sh, Shape::Prefix(Op::AddU, _, _, 0, incl) if *incl == inclusive)
+        )), "prefix must be recognized (inclusive={inclusive})");
+        let shader = build_wave(
+            &words,
+            vec![param(RootType::Table, 0)],
+            vec![entry(ResourceType::Uav, 4, 0)],
+            128,
+            true,
+        );
+        let c = crate::Container::parse(&shader.dxil).unwrap();
+        let psv = c.part(crate::FourCC::PSV0).unwrap().data;
+        assert_eq!(u32::from_le_bytes(psv[20..24].try_into().unwrap()), 0);
+        assert_eq!(u32::from_le_bytes(psv[24..28].try_into().unwrap()), u32::MAX);
+        let want: Vec<u32> = (0..128u32).map(|i| {
+            let base = i & !63;
+            (base..i + u32::from(inclusive)).sum()
+        }).collect();
+        let mut ran = 0;
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                eprintln!("no SM 6.6 {label} device; skipped");
+                continue;
+            };
+            let (root, pso) = host.compute_pipeline(&shader).unwrap_or_else(
+                |e| panic!("{label}: compute pipeline failed: {e}"),
+            );
+            let out = host.dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(vec![0; shader.user_data_dwords().max(1) as usize]))],
+                    views: &[View::RawUav(128)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            ).unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            assert_eq!(out[0], want, "{label}: inclusive={inclusive}");
+            eprintln!("{label}: recognized wave64 prefix passed (inclusive={inclusive})");
+            ran += 1;
+        }
+        assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+    }
+}
+
+#[test]
 fn a_half_buffer_load_by_index_reads_the_structured_element() {
     let mut code = HALF_LOAD_WAVE32.to_vec();
     // buffer_load_ushort v2, v0, s[8:11], 0 idxen offset:6.
