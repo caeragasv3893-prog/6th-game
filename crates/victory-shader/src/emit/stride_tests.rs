@@ -999,6 +999,17 @@ fn wave64_integer_butterfly_reductions_cross_warps() {
 
 #[test]
 fn wave64_recognized_integer_reductions_use_shared_accumulators() {
+    check_integer_reductions(128);
+}
+
+#[test]
+fn wave64_recognized_integer_reductions_partial_groups() {
+    for threads in [1, 33, 65, 96, 127] {
+        check_integer_reductions(threads);
+    }
+}
+
+fn check_integer_reductions(threads: u32) {
     use super::wave::{Op, Shape};
     let vop3 = |dst: u32, op: u32, a: u32, b: u32, c: u32| {
         [0xD400_0000 | (op << 16) | dst, a | (b << 9) | (c << 18)]
@@ -1069,7 +1080,7 @@ fn wave64_recognized_integer_reductions_use_shared_accumulators() {
             &words,
             vec![param(RootType::Table, 0)],
             vec![entry(ResourceType::Uav, 4, 0)],
-            128,
+            threads,
             true,
         );
         let c = crate::Container::parse(&shader.dxil).unwrap();
@@ -1088,11 +1099,12 @@ fn wave64_recognized_integer_reductions_use_shared_accumulators() {
             _ => unreachable!(),
         };
         let mut want = Vec::new();
-        for base in [0u32, 64] {
-            let result = (base..base + 64)
+        for base in (0..threads).step_by(64) {
+            let end = (base + 64).min(threads);
+            let result = (base..end)
                 .map(|i| if signed_or_unsigned_extrema { i << 26 } else { i })
                 .fold(identity, reference);
-            want.extend([result; 64]);
+            want.extend(std::iter::repeat_n(result, (end - base) as usize));
         }
         let mut ran = 0;
         for (label, warp) in [("hardware", false), ("warp", true)] {
@@ -1108,13 +1120,13 @@ fn wave64_recognized_integer_reductions_use_shared_accumulators() {
                 &pso,
                 &Dispatch {
                     roots: vec![(0, Root::Constants(vec![0; shader.user_data_dwords().max(1) as usize]))],
-                    views: &[View::RawUav(128)],
+                    views: &[View::RawUav(threads)],
                     samplers: &[],
                     groups: [1, 1, 1],
                 },
             ).unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
-            assert_eq!(out[0], want, "{label}: {op:?}");
-            eprintln!("{label}: recognized wave64 {op:?} passed");
+            assert_eq!(out[0], want, "{label}: {op:?}, threads={threads}");
+            eprintln!("{label}: recognized wave64 {op:?} passed (threads={threads})");
             ran += 1;
         }
         assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
@@ -1123,6 +1135,17 @@ fn wave64_recognized_integer_reductions_use_shared_accumulators() {
 
 #[test]
 fn wave64_recognized_integer_prefix_sums_cross_warps() {
+    check_integer_prefixes(128);
+}
+
+#[test]
+fn wave64_recognized_integer_prefix_sums_partial_groups() {
+    for threads in [1, 31, 33, 65, 96, 127] {
+        check_integer_prefixes(threads);
+    }
+}
+
+fn check_integer_prefixes(threads: u32) {
     use super::wave::{Op, Shape};
     let vop3 = |dst: u32, op: u32, a: u32, b: u32, c: u32| {
         [0xD400_0000 | (op << 16) | dst, a | (b << 9) | (c << 18)]
@@ -1176,14 +1199,14 @@ fn wave64_recognized_integer_prefix_sums_cross_warps() {
             &words,
             vec![param(RootType::Table, 0)],
             vec![entry(ResourceType::Uav, 4, 0)],
-            128,
+            threads,
             true,
         );
         let c = crate::Container::parse(&shader.dxil).unwrap();
         let psv = c.part(crate::FourCC::PSV0).unwrap().data;
         assert_eq!(u32::from_le_bytes(psv[20..24].try_into().unwrap()), 0);
         assert_eq!(u32::from_le_bytes(psv[24..28].try_into().unwrap()), u32::MAX);
-        let want: Vec<u32> = (0..128u32).map(|i| {
+        let want: Vec<u32> = (0..threads).map(|i| {
             let base = i & !63;
             (base..i + u32::from(inclusive)).sum()
         }).collect();
@@ -1201,13 +1224,13 @@ fn wave64_recognized_integer_prefix_sums_cross_warps() {
                 &pso,
                 &Dispatch {
                     roots: vec![(0, Root::Constants(vec![0; shader.user_data_dwords().max(1) as usize]))],
-                    views: &[View::RawUav(128)],
+                    views: &[View::RawUav(threads)],
                     samplers: &[],
                     groups: [1, 1, 1],
                 },
             ).unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
             assert_eq!(out[0], want, "{label}: inclusive={inclusive}");
-            eprintln!("{label}: recognized wave64 prefix passed (inclusive={inclusive})");
+            eprintln!("{label}: recognized wave64 prefix passed (inclusive={inclusive}, threads={threads})");
             ran += 1;
         }
         assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
