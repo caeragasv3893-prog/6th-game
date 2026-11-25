@@ -675,10 +675,11 @@ impl<'a> Lower<'a> {
             };
             let wave = if x.native.wave64 { 64 } else { 32 };
             let one_wave = cs.threads.iter().product::<u32>() <= wave;
-            // A narrow portable subset: literal MBCNT, unmasked bpermute
-            // and ballots of unmasked integer compares. Scratch operations
-            // require complete logical waves and no title LDS or guards:
-            // every thread must reach both group barriers.
+            // Scratch operations require no title LDS and a single block.
+            // Partial waves and per-instruction EXEC masks are admitted
+            // only for explicit bpermute, whose inactive sources read zero.
+            // Other cross-lane operations still require complete waves
+            // and full EXEC; every thread must reach the group barriers.
             let reduction = x.native.wave64 && portable_reduction_section(x);
             let scratch = reduction || insts().any(|i| {
                 matches!(i.name(), "ds_bpermute_b32" | "ds_swizzle_b32" | "v_readlane_b32")
@@ -686,10 +687,27 @@ impl<'a> Lower<'a> {
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
             });
             let threads = cs.threads.iter().product::<u32>();
+            // Do not widen the eligibility of recognized reductions,
+            // ballots, DPP, swizzle or readlane along with bpermute.
+            let exchange_only = !reduction
+                && insts().any(|i| i.name() == "ds_bpermute_b32")
+                && insts().all(|i| !reads_mask_as_data(x.st, i)
+                    && !matches!(i.name(), "ds_swizzle_b32" | "v_readlane_b32"
+                        | "s_bcnt1_i32_b64" | "v_mbcnt_lo_u32_b32" | "v_mbcnt_hi_u32_b32")
+                    && !matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some()));
+            let uniform = x.st.guards.iter().flatten().all(|g| g.is_none() || *g == Some(Bool::TRUE));
+            let guarded_exchanges = exchange_only && p.blocks.len() == 1
+                && p.blocks[0].insts.iter().enumerate().all(|(n, i)| {
+                    let g = x.st.guards[0][n];
+                    g.is_none() || g == Some(Bool::TRUE)
+                        || i.name() == "ds_bpermute_b32"
+                            && g.is_some_and(|g| x.st.bools.support(g).iter()
+                                .all(|a| matches!(a, Atom::Constant(_))))
+                });
             portable_lanes = x.native.wave64
-                && (!scratch || (64..=1024).contains(&threads)
-                    && threads.is_multiple_of(64)
-                    && (reduction || x.st.guards.iter().flatten().all(|g| g.is_none() || *g == Some(Bool::TRUE))))
+                && (!scratch || (1..=1024).contains(&threads)
+                    && (threads.is_multiple_of(64) || exchange_only)
+                    && (reduction || uniform || guarded_exchanges))
                 && console_lanes
                 && s.lds_dwords == 0
                 && p.blocks.len() == 1
@@ -708,6 +726,9 @@ impl<'a> Lower<'a> {
                         "s_mov_b32" | "s_load_dwordx4" => i.writes.iter().all(
                             |&(r, _)| matches!(r, Reg::S(0..=103)),
                         ),
+                        "s_mov_b64" if guarded_exchanges => matches!(&i.fields,
+                            Fields::Sop { dst: Some(Operand::Scalar { code: EXEC, .. }), src, .. }
+                                if matches!(src.first(), Some(Operand::Const(128..=208) | Operand::Literal(_)))),
                         "s_bcnt1_i32_b64" => i.writes.iter().all(
                             |&(r, _)| matches!(r, Reg::S(0..=103) | Reg::Scc),
                         ),
@@ -3438,6 +3459,18 @@ impl<'a> Lower<'a> {
         let mask = self.s.m.i32(!63u32);
         let base = self.s.m.bin(c, Bin::And, flat, mask);
         let src = self.s.m.bin(c, Bin::Or, base, lane);
+        let threads = self.s.threads.expect("portable compute").iter().product::<u32>();
+        let valid = if threads.is_multiple_of(64) {
+            None
+        } else {
+            let end = self.s.m.i32(threads);
+            Some(self.s.m.cmp(c, pred::IULT, src, end))
+        };
+        let src = if let Some(on) = valid {
+            self.s.m.select(c, on, src, flat)
+        } else {
+            src
+        };
         let lds = self.s.lds();
         let dst = self.s.m.element(c, lds, flat);
         let from = self.s.m.element(c, lds, src);
@@ -3446,7 +3479,12 @@ impl<'a> Lower<'a> {
         self.s.op(c, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[mode]);
         let r = self.s.m.load(c, from);
         self.s.op(c, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[mode]);
-        r
+        if let Some(on) = valid {
+            let zero = self.s.m.i32(0);
+            self.s.m.select(c, on, r, zero)
+        } else {
+            r
+        }
     }
 
     fn read_lane(&mut self, x: V, lane: V) -> V {
@@ -3566,6 +3604,14 @@ impl<'a> Lower<'a> {
             if self.portable_lanes {
                 // Each logical wave has its own 64 consecutive scratch slots.
                 // All threads execute the store, barrier, load and barrier.
+                // Inactive lanes publish zero but still participate in
+                // both barriers. Their destination is preserved by write().
+                let x = if let Some(on) = guard {
+                    let zero = self.s.m.i32(0);
+                    self.s.m.select(c, on, x, zero)
+                } else {
+                    x
+                };
                 let r = self.portable_read_lane(x, lane);
                 let reg = dst_reg.ok_or("a permute result")?;
                 self.write(inst, Reg::V(reg), r, guard);
