@@ -541,8 +541,15 @@ may offset the reduction. Scratch size and eligible shader subset are
 unchanged. The regression now also tests isolated bit 31 and bit 63,
 including clearing masks after a previous ballot. A host-side arithmetic
 model checked 10000 generated masks against a 64-bit reference.
-Windows compilation, DXIL validation, dispatch and performance
-measurements are pending for this optimization.
+Windows validation at revision `6b72a49` passed all five targeted
+wave64 tests (0.64 s), including the expanded ballot regression on
+both hardware and WARP. Strict all-features Clippy passed in 2.99 s.
+The full locked all-features workspace suite passed 723 tests, with
+zero failures and 11 ignored (excluding the repeated HLE subprocess
+result). This includes 253 shader tests, 158 GPU tests and 143 HLE
+tests. The locked release build completed successfully in 17.08 s.
+GPU ballot performance measurements and real title validation remain
+pending; the explicit load-count reduction is not a measured speedup.
 
 ### Development roadmap
 
