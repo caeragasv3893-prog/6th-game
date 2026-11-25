@@ -273,8 +273,11 @@ covered by this change.
 
 A new synthetic compute regression checks a 16-bit field at byte offset 6
 in each of 32 separate 12-byte elements, with distinct neighbouring data.
-The reference arithmetic was checked for all 32 lanes. Windows compilation
-and hardware/WARP dispatch validation are pending.
+The reference arithmetic was checked for all 32 lanes. On revision
+`f0862b7`, all three targeted halfword tests passed on Windows in 0.52 s,
+and strict all-features workspace Clippy passed in 3.43 s. The full
+workspace regression run and release build for this revision remain pending.
+The last fully validated workspace baseline is still 719 passing tests.
 
 ```powershell
 cargo test -p victory-shader --lib --locked a_half_buffer_load -- --test-threads=1 --nocapture
