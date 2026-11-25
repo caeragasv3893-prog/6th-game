@@ -551,6 +551,46 @@ tests. The locked release build completed successfully in 17.08 s.
 GPU ballot performance measurements and real title validation remain
 pending; the explicit load-count reduction is not a measured speedup.
 
+### Portable integer butterfly reductions (2026-11-25)
+
+The straight-line portable wave64 compute path now permits lane-local
+integer addition, signed and unsigned min/max, and bitwise AND/OR/XOR
+alongside the validated uniform `ds_bpermute_b32` exchange. This
+allows explicit butterfly reduction sequences to operate across both
+halves of each logical wave without requiring physical wave64.
+
+```mermaid
+flowchart LR
+    A["64 lane inputs"] --> B["XOR partner 1"]
+    B --> C["XOR partner 2"]
+    C --> D["XOR partner 4"]
+    D --> E["XOR partner 8"]
+    E --> F["XOR partner 16"]
+    F --> G["XOR partner 32"]
+    G --> H["Full logical-wave result"]
+```
+
+Each step exchanges a value with its XOR partner and combines the two
+values. The final step spans the 32-lane boundary. Addition wraps
+modulo 2^32; signed and unsigned extrema retain their distinct ordering.
+The regression constructs eight such reductions for a 128-thread
+group (two independent logical waves), checks all 1024 output dwords,
+and repeats dispatches on hardware and WARP. An independent arithmetic
+model checked 262,144 lane results across 256 generated
+input groups and eight operations.
+
+This is support for explicit uniform exchange-and-ALU sequences, not
+general lowering of the existing whole-wave `Shape::Active` or
+`Shape::Prefix` recognizer. DPP, divergent EXEC, floating-point
+reductions and arbitrary control flow still use the existing paths.
+Each exchange requires two group barriers; no speedup is claimed.
+Windows compilation, DXIL validation and GPU dispatch are pending.
+
+```powershell
+cargo test -p victory-shader --lib --locked wave64_ -- --test-threads=1 --nocapture
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+```
+
 ### Development roadmap
 
 - [x] Build the project on the NVIDIA test machine.
