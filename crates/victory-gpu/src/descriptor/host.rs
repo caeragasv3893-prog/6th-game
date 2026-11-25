@@ -1471,7 +1471,7 @@ mod tests {
         assert!(!raw_range_valid(64, 0, 0));
         assert!(!raw_range_valid(64, 2, 4));
         assert!(!raw_range_valid(64, 0, 3));
-        assert!(!raw_range_valid(u64::MAX, u64::MAX - 3, 4));
+        assert!(!raw_range_valid(u64::MAX, u64::MAX - 15, 16));
     }
 
     #[test]
