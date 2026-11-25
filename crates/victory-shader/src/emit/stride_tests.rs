@@ -1228,6 +1228,58 @@ fn check_fp32_prefix(inclusive: bool) {
 }
 
 #[test]
+fn wave64_explicit_swizzle_and_readlane_use_logical_lanes() {
+    let words = [
+        0xBE84_0300, 0xBE85_0380,
+        0xF408_0202, 0xFA00_0000,
+        0x3404_0082, 0xBF8C_C07F,
+        0xD8D4_7C1F, 0x0100_0000, // ds_swizzle_b32 v1, v0: xor 31
+        0xBF8C_C07F,
+        0xE070_1000, 0x8002_0102,
+        0xD760_0014, 0x0001_7F00, // v_readlane_b32 s20, v0, 63
+        0x7E02_0214, // v_mov_b32 v1, s20
+        0xE070_1200, 0x8002_0102,
+        0xBF81_0000,
+    ];
+    let shader = build_wave(
+        &words,
+        vec![param(RootType::Table, 0)],
+        vec![entry(ResourceType::Uav, 4, 0)],
+        128,
+        true,
+    );
+    let c = crate::Container::parse(&shader.dxil).unwrap();
+    let psv = c.part(crate::FourCC::PSV0).unwrap().data;
+    assert_eq!(u32::from_le_bytes(psv[20..24].try_into().unwrap()), 0);
+    assert_eq!(u32::from_le_bytes(psv[24..28].try_into().unwrap()), u32::MAX);
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host.compute_pipeline(&shader).unwrap_or_else(
+            |e| panic!("{label}: compute pipeline failed: {e}"),
+        );
+        let out = host.dispatch(&root, &pso, &Dispatch {
+            roots: vec![(0, Root::Constants(vec![0; shader.user_data_dwords().max(1) as usize]))],
+            views: &[View::RawUav(256)],
+            samplers: &[],
+            groups: [1, 1, 1],
+        }).unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        for lane in 0..128u32 {
+            assert_eq!(out[0][lane as usize], lane ^ 31, "{label}: swizzle lane {lane}");
+            assert_eq!(out[0][128 + lane as usize], lane | 63, "{label}: readlane {lane}");
+        }
+        eprintln!("{label}: wave64 swizzle and literal readlane passed");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+#[test]
 fn wave64_explicit_dpp_preserves_row_and_bank_masks() {
     let mut words = vec![
         0xBE84_0300, 0xBE85_0380,
