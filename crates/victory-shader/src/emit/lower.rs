@@ -483,7 +483,7 @@ fn portable_reduction_section(x: &Parts<'_>) -> bool {
             && matches!(i.name(), "v_cndmask_b32" | "v_mov_b32" | "v_readlane_b32"
                 | "v_permlanex16_b32" | "v_add_nc_u32" | "v_sub_nc_u32" | "v_min_u32" | "v_max_u32"
                 | "v_min_i32" | "v_max_i32" | "v_and_b32" | "v_or_b32" | "v_xor_b32"
-                | "v_min_f32" | "v_max_f32" | "v_add_f32")
+                | "v_min_f32" | "v_max_f32" | "v_add_f32" | "v_add_f16")
             && i.writes.iter().all(|&(r, _)| matches!(r, Reg::V(_) | Reg::S(0..=103)))
     }) {
         return false;
@@ -522,6 +522,11 @@ fn portable_reduction_section(x: &Parts<'_>) -> bool {
                     Some(Shape::Active(Op::AddF, src, mask, ident))
                         if *mask == saved && !defined.contains(src)
                             && super::wave::ordered_sum(inside, v, *src, saved, *ident).is_some() => {
+                        live = true;
+                    }
+                    Some(Shape::Half(Op::AddH, src, mask, ident, hi))
+                        if *mask == saved && !defined.contains(src) && *hi < 64
+                            && super::wave::ordered_half_sum(inside, v, *src, saved, *ident).is_some() => {
                         live = true;
                     }
                     Some(Shape::Prefix(Op::AddF, src, mask, ident, inclusive))
@@ -1270,7 +1275,7 @@ impl<'a> Lower<'a> {
                             &self.x.p.blocks[b].insts[start + 1..end], w, src, mask, ident,
                         );
                         tree.ok_or("an unrecognized ordered FP32 sum")
-                            .and_then(|tree| self.portable_ordered_sum(src, tree))
+                            .and_then(|tree| self.portable_ordered_sum(src, tree, None))
                     }
                     Some(super::wave::Shape::Prefix(super::wave::Op::AddF, src, mask, ident, inclusive))
                         if self.portable_lanes => {
@@ -1279,7 +1284,16 @@ impl<'a> Lower<'a> {
                             &self.x.p.blocks[b].insts[start + 1..end], w, src, mask, ident, inclusive,
                         );
                         tree.ok_or("an unrecognized ordered FP32 prefix")
-                            .and_then(|tree| self.portable_ordered_sum(src, tree))
+                            .and_then(|tree| self.portable_ordered_sum(src, tree, None))
+                    }
+                    Some(super::wave::Shape::Half(super::wave::Op::AddH, src, mask, ident, hi))
+                        if self.portable_lanes => {
+                        let end = self.sections[&b][&start].end;
+                        let tree = super::wave::ordered_half_sum(
+                            &self.x.p.blocks[b].insts[start + 1..end], w, src, mask, ident,
+                        );
+                        tree.ok_or("an unrecognized ordered FP16 sum")
+                            .and_then(|tree| self.portable_ordered_sum(src, tree, Some(hi)))
                     }
                     _ => shape.ok_or(UNKNOWN).and_then(|sh| self.shape(sh)),
                 };
@@ -2110,11 +2124,11 @@ impl<'a> Lower<'a> {
         if inclusive { sum } else { self.s.m.bin(c, Bin::Sub, sum, value) }
     }
 
-    /// Replay the original FP32 expression graph over logical lanes.
+    /// Replay the original FP32 or low-half FP16 graph over logical lanes.
     /// Eligibility proves full original EXEC; publish every input once,
     /// then evaluate only the graph reachable from the uniform result.
     fn portable_ordered_sum(
-        &mut self, source: Value, tree: super::wave::OrderedSum,
+        &mut self, source: Value, tree: super::wave::OrderedSum, half_hi: Option<u32>,
     ) -> Result<V, Why> {
         let value = self.i32_of(source)?;
         let c = self.cur;
@@ -2136,16 +2150,30 @@ impl<'a> Lower<'a> {
                 needed[b] = true;
             }
         }
+        if let Some(hi) = half_hi {
+            needed[hi as usize] = true;
+        }
         self.s.m.store(c, own, value);
         self.s.op(c, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[mode]);
         let mut values = vec![None; needed.len()];
+        let mut high_word = None;
+        let low = self.s.m.i32(0xFFFF);
         for lane in 0..64 {
             if needed[lane] {
                 let k = self.s.m.i32(lane as u32);
                 let index = self.s.m.bin(c, Bin::Or, base, k);
                 let ptr = self.s.m.element(c, lds, index);
                 let bits = self.s.m.load(c, ptr);
-                values[lane] = Some(self.as_float(bits));
+                if half_hi == Some(lane as u32) {
+                    high_word = Some(bits);
+                }
+                let f = if half_hi.is_some() {
+                    let h = self.s.m.bin(c, Bin::And, bits, low);
+                    self.s.op(c, "legacyF16ToF32", Attr::ReadNone, self.s.t.f32, 131, &[h])
+                } else {
+                    self.as_float(bits)
+                };
+                values[lane] = Some(f);
             }
         }
         self.s.op(c, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[mode]);
@@ -2153,7 +2181,14 @@ impl<'a> Lower<'a> {
             if needed[64 + i] {
                 let lhs = values[a].expect("reachable sum operand");
                 let rhs = values[b].expect("reachable sum operand");
-                values[64 + i] = Some(self.s.m.bin(c, Bin::Add, lhs, rhs));
+                let f = self.s.m.bin(c, Bin::Add, lhs, rhs);
+                let f = if half_hi.is_some() {
+                    let h = self.narrow16(f);
+                    self.s.op(c, "legacyF16ToF32", Attr::ReadNone, self.s.t.f32, 131, &[h])
+                } else {
+                    f
+                };
+                values[64 + i] = Some(f);
             }
         }
         let zero = self.s.m.i32(0);
@@ -2172,7 +2207,15 @@ impl<'a> Lower<'a> {
                 result = self.s.m.select(c, on, x, result);
             }
         }
-        Ok(self.as_int(result))
+        if let Some(high_word) = high_word {
+            let high_mask = self.s.m.i32(0xFFFF_0000);
+            let high = self.s.m.bin(c, Bin::And, high_word, high_mask);
+            let h = self.narrow16(result);
+            let h = self.s.m.bin(c, Bin::And, h, low);
+            Ok(self.s.m.bin(c, Bin::Or, high, h))
+        } else {
+            Ok(self.as_int(result))
+        }
     }
 
     /// Fixed butterfly over the logical wave. Use the normal FP extrema
