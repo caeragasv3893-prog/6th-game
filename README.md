@@ -307,9 +307,10 @@ guarantee is claimed.
 The layout arithmetic was independently checked over 1,000,003 requested
 capacities, including the maximum u32. The oversized heap regression now
 checks persistent allocation and reuse even with all transient slots held.
-The Windows tester reported that the targeted descriptor tests and strict
-all-features Clippy passed. Full workspace results and timings for this
-revision have not been supplied.
+The Windows test log confirms 11 targeted descriptor tests passed, zero
+failed and one benchmark was ignored (0.52 s). Strict all-features Clippy
+also passed (0.15 s, incremental). A new full workspace run and release
+build have not yet been confirmed.
 
 ```powershell
 cargo test -p victory-gpu --lib --locked descriptor::host::tests -- --test-threads=1 --nocapture
