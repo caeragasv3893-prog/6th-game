@@ -307,7 +307,9 @@ guarantee is claimed.
 The layout arithmetic was independently checked over 1,000,003 requested
 capacities, including the maximum u32. The oversized heap regression now
 checks persistent allocation and reuse even with all transient slots held.
-Compilation and Windows GPU validation remain pending.
+The Windows tester reported that the targeted descriptor tests and strict
+all-features Clippy passed. Full workspace results and timings for this
+revision have not been supplied.
 
 ```powershell
 cargo test -p victory-gpu --lib --locked descriptor::host::tests -- --test-threads=1 --nocapture
