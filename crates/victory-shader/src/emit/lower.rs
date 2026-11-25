@@ -223,7 +223,7 @@ struct Lower<'a> {
     /// Compute code that reads other lanes: thread ids follow the host
     /// lanes, so lane n is console lane n.
     console_lanes: bool,
-    /// Straight-line wave64 code with only lane-local numbering.
+    /// Straight-line wave64 code with portable numbering and optional LDS exchange.
     portable_lanes: bool,
     /// Pixel: an ordered section (POPS), whose UAVs the host makes
     /// rasterizer-ordered views.
@@ -535,12 +535,16 @@ impl<'a> Lower<'a> {
             };
             let wave = if x.native.wave64 { 64 } else { 32 };
             let one_wave = cs.threads.iter().product::<u32>() <= wave;
-            // A narrow, deliberately conservative portable subset:
-            // MBCNT of a literal mask only depends on the console lane
-            // number, not on another lane's value. A straight-line shader
-            // with no shared memory, mask changes or cross-lane operations
-            // can derive that number from the flat group thread ID.
+            // A narrow portable subset: literal MBCNT and unmasked
+            // bpermute in straight-line compute code. For bpermute,
+            // require complete logical waves and no title LDS or guards:
+            // every thread must reach both group barriers.
+            let exchange = insts().any(|i| i.name() == "ds_bpermute_b32");
+            let threads = cs.threads.iter().product::<u32>();
             portable_lanes = x.native.wave64
+                && (!exchange || (64..=1024).contains(&threads)
+                    && threads.is_multiple_of(64)
+                    && x.st.guards.iter().flatten().all(|g| g.is_none() || *g == Some(Bool::TRUE)))
                 && console_lanes
                 && s.lds_dwords == 0
                 && p.blocks.len() == 1
@@ -560,10 +564,16 @@ impl<'a> Lower<'a> {
                         "v_mov_b32" | "v_lshlrev_b32" => {
                             matches!(&i.fields, Fields::Valu(v) if v.dpp.is_none())
                         }
+                        "ds_bpermute_b32" => matches!(&i.fields, Fields::Ds { gds: false, .. }),
                         "s_waitcnt" | "s_endpgm" | "buffer_store_dword" => true,
                         _ => false,
                     }
                 });
+            if portable_lanes && exchange {
+                // The entire group's scratch is private to this lowering.
+                // Reuse it only after all readers have reached the second barrier.
+                s.lds_dwords = threads;
+            }
             if !portable_lanes && (console_lanes || one_wave && s.lds_dwords > 0) {
                 s.wave_size = Some(wave);
             }
@@ -3070,7 +3080,9 @@ impl<'a> Lower<'a> {
         if name == "ds_bpermute_b32" {
             // Each lane reads `data` of the lane its address plus the offset
             // names in dwords (modulo the wave); 0 from a lane EXEC leaves out.
-            self.cross_lane(false)?;
+            if !self.portable_lanes {
+                self.cross_lane(false)?;
+            }
             let a = self.vgprs(inst, addr.as_ref().ok_or("a permute address")?, 1)?[0];
             let x = self.vgprs(inst, data.first().ok_or("a permute source")?, 1)?[0];
             let k = |l: &mut Self, v: u32| l.s.m.i32(v);
@@ -3078,6 +3090,25 @@ impl<'a> Lower<'a> {
             let at = self.s.m.bin(c, Bin::Add, a, o);
             let lane = self.s.m.bin(c, Bin::LShr, at, two);
             let lane = self.s.m.bin(c, Bin::And, lane, last);
+            if self.portable_lanes {
+                // Each logical wave has its own 64 consecutive scratch slots.
+                // All threads execute the store, barrier, load and barrier.
+                let flat = self.mesh_thread();
+                let mask = self.s.m.i32(!63u32);
+                let base = self.s.m.bin(c, Bin::And, flat, mask);
+                let src = self.s.m.bin(c, Bin::Or, base, lane);
+                let lds = self.s.lds();
+                let dst = self.s.m.element(c, lds, flat);
+                let from = self.s.m.element(c, lds, src);
+                self.s.m.store(c, dst, x);
+                let mode = self.s.m.i32(1 | 8);
+                self.s.op(c, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[mode]);
+                let r = self.s.m.load(c, from);
+                self.s.op(c, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[mode]);
+                let reg = dst_reg.ok_or("a permute result")?;
+                self.write(inst, Reg::V(reg), r, guard);
+                return Ok(());
+            }
             let r = self.read_lane(x, lane);
             let on = guard.unwrap_or_else(|| self.s.m.bool(true));
             let i32t = self.s.t.i32;
