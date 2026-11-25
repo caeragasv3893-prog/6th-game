@@ -289,6 +289,31 @@ and pipeline integration; the existing rectangle geometry generator is not
 a translator for those programs. No change to native geometry translation
 or wave64 emulation is claimed in this revision.
 
+### Persistent descriptor capacity (2026-11-25)
+
+Every resource heap layout now reserves at least 65,536 physical slots for
+persistent views, in addition to the minimum transient allocation of 65,536
+slots and the overflow mapping range. Stable raw SRV companions allocate
+only from the persistent region, rather than permanently taking transient
+command-list slots. Ordinary copy views retain their transient fallback.
+
+This trades some identity-mapped title capacity for predictable separation
+of descriptor lifetimes. The capped layout now has 803,389 identity slots,
+65,536 overflow slots, 65,536 transient slots and 65,536 persistent slots
+(excluding the three reserved terminal slots). Exhausting persistent space
+can still result in a null companion; no eviction or live-title capacity
+guarantee is claimed.
+
+The layout arithmetic was independently checked over 1,000,003 requested
+capacities, including the maximum u32. The oversized heap regression now
+checks persistent allocation and reuse even with all transient slots held.
+Compilation and Windows GPU validation remain pending.
+
+```powershell
+cargo test -p victory-gpu --lib --locked descriptor::host::tests -- --test-threads=1 --nocapture
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+```
+
 ### Development roadmap
 
 - [x] Build the project on the NVIDIA test machine.
