@@ -622,9 +622,12 @@ four DPP row sums, reads their final lanes, and combines them. It checks
 the symbolic recognizer actually produces an integer sum, unrestricted
 DXIL wave bounds and the expected output for two independent 64-lane
 waves (2016 and 6112). The row-sum reference arithmetic was checked
-independently. Windows compilation, DXIL validation and dispatch are
-pending; the new automatic path has a sum integration test, not yet
-individual GPU tests for every accumulator operation.
+independently. Windows validation at revision `8cb3f53` passed all
+seven targeted wave64 tests (0.98 s), including the recognized sum
+integration test on both hardware and WARP. Strict all-features Clippy
+passed in 3.22 s. The new automatic path still lacks individual GPU
+tests for the other accumulator operations. Full workspace regression,
+release validation and performance measurements remain pending.
 
 This does not yet support arbitrary whole-wave sections, prefixes,
 floating-point reductions or divergent EXEC. Atomic contention and
