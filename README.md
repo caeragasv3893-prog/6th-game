@@ -450,9 +450,13 @@ conservative uniform subset described above is currently eligible.
 A new synthetic regression checks two successive exchanges across the
 32-lane boundary, two independent logical waves, three dispatches on
 each available adapter and the fixed-width fallback for a 96-thread
-group. Reference arithmetic was checked for all 128 outputs. Rust
-compilation, DXIL validation, GPU execution and full regression tests
-remain pending. This is not general wave64 emulation; divergent exchange,
+group. Reference arithmetic was checked for all 128 outputs. Windows validation at
+revision `e63d60b` passed all four targeted wave64 tests (0.43 s).
+The new exchange regression explicitly reported success on both
+hardware and WARP, with three dispatches on each adapter and two
+successive exchanges per dispatch. Strict all-features Clippy passed
+in 3.17 s. Full workspace regression and release validation remain
+pending. This is not general wave64 emulation; divergent exchange,
 ballots, reductions and title LDS behavior still require separate work.
 Group barriers may also add GPU cost; no performance improvement is
 claimed.
