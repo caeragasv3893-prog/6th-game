@@ -827,10 +827,31 @@ on hardware and WARP when available. Windows validation at revision
 this regression on both hardware and WARP. Strict Clippy reported one
 assign-op-pattern lint in the CPU reference, not the translator. Revision
 `971e9ec` adds a local lint exception to preserve the operand order;
-strict Clippy revalidation and full workspace tests remain pending.
-Exclusive FP32
-prefixes, general divergent sections, FP16 and performance remain open.
+Windows revalidation at revision `e23e671` passed strict all-features
+Clippy in 2.60 s, every executed workspace test (including 260 shader
+tests, three shader tests ignored) and the release build in 16.54 s.
 No AMD hardware or title execution validation is implied.
+
+### Ordered exclusive FP32 prefixes and explicit FP16 exchanges (2026-11-25)
+
+The ordered replay now also accepts exclusive FP32 prefixes constructed
+by moving previously computed prefix results into the preceding lane's
+position, with an explicit positive-zero identity in lane zero.
+Each result must contain exactly the preceding logical lanes, without
+duplicates. Floating subtraction is not used to recover exclusive
+prefixes: it would change rounding and exceptional-value behavior.
+The regression exercises row-boundary carries and the same
+rounding-sensitive and exceptional inputs as the inclusive scan.
+
+The uniform explicit bpermute path now admits lane-local FP16
+add/min/max without DPP, using the existing half-precision arithmetic
+lowering and destination-half preservation. The new regression checks
+two logical waves, intermediate half rounding and preservation of each
+lane's original high half. These additions require Windows compilation,
+strict Clippy, DXIL and GPU validation. Automatic whole-wave FP16
+recognition, general divergent EXEC, arbitrary DPP and performance
+optimization remain open; no unsupported cases have been silently
+enabled.
 
 ### Development roadmap
 
