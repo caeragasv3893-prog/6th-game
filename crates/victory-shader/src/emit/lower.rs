@@ -681,7 +681,8 @@ impl<'a> Lower<'a> {
             // every thread must reach both group barriers.
             let reduction = x.native.wave64 && portable_reduction_section(x);
             let scratch = reduction || insts().any(|i| {
-                i.name() == "ds_bpermute_b32" || reads_mask_as_data(x.st, i)
+                matches!(i.name(), "ds_bpermute_b32" | "ds_swizzle_b32" | "v_readlane_b32")
+                    || reads_mask_as_data(x.st, i)
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
             });
             let threads = cs.threads.iter().product::<u32>();
@@ -737,7 +738,14 @@ impl<'a> Lower<'a> {
                             matches!(&i.fields, Fields::Valu(v) if v.dpp.is_none())
                                 && i.writes.iter().all(|&(r, _)| matches!(r, Reg::S(106..=107)))
                         }
-                        "ds_bpermute_b32" => matches!(&i.fields, Fields::Ds { gds: false, .. }),
+                        "ds_bpermute_b32" | "ds_swizzle_b32" =>
+                            matches!(&i.fields, Fields::Ds { gds: false, .. }),
+                        "v_readlane_b32" => matches!(&i.fields, Fields::Valu(v)
+                            if v.dpp.is_none()
+                                && matches!(v.src.first(), Some(Operand::Vector { .. }))
+                                && v.src.get(1).and_then(|&o| crate::resource::lane_of(o))
+                                    .is_some_and(|lane| lane < 64))
+                            && i.writes.iter().all(|&(r, _)| matches!(r, Reg::S(0..=103))),
                         "buffer_load_dword" => !root_memory,
                         "s_waitcnt" | "s_endpgm" | "buffer_store_dword" => true,
                         _ => false,
@@ -2196,17 +2204,25 @@ impl<'a> Lower<'a> {
         let root_value = |root: usize| {
             if root == usize::MAX { zero } else { values[root].expect("reachable sum result") }
         };
-        let mut result = root_value(tree.roots[0]);
-        if !tree.roots.iter().all(|&root| root == tree.roots[0]) {
-            let mask = self.s.m.i32(63);
-            let logical = self.s.m.bin(c, Bin::And, flat, mask);
-            for (lane, &root) in tree.roots.iter().enumerate().skip(1) {
-                let index = self.s.m.i32(lane as u32);
-                let on = self.s.m.cmp(c, pred::EQ, logical, index);
-                let x = root_value(root);
-                result = self.s.m.select(c, on, x, result);
+        let result = if tree.roots.iter().all(|&root| root == tree.roots[0]) {
+            root_value(tree.roots[0])
+        } else {
+            // A balanced lane-selection tree keeps the dependency depth
+            // at six selects instead of a chain of 63. Arithmetic order
+            // within each root is untouched.
+            let mut choices: Vec<V> = tree.roots.iter().map(|&root| root_value(root)).collect();
+            let zero = self.s.m.i32(0);
+            for bit in 0..6 {
+                let mask = self.s.m.i32(1 << bit);
+                let selected = self.s.m.bin(c, Bin::And, flat, mask);
+                let on = self.s.m.cmp(c, pred::NE, selected, zero);
+                choices = choices.chunks_exact(2).map(|pair| {
+                    if pair[0] == pair[1] { pair[0] }
+                    else { self.s.m.select(c, on, pair[1], pair[0]) }
+                }).collect();
             }
-        }
+            choices[0]
+        };
         if let Some(high_word) = high_word {
             let high_mask = self.s.m.i32(0xFFFF_0000);
             let high = self.s.m.bin(c, Bin::And, high_word, high_mask);
@@ -3498,7 +3514,7 @@ impl<'a> Lower<'a> {
             // Mesh: host quads are threads 4n..4n+3 of a 1D group, as the
             // console's, so quad-local swizzles read through quad operations.
             let mesh_quad = self.s.mesh.is_some() && quad;
-            if !mesh_quad {
+            if !mesh_quad && !self.portable_lanes {
                 self.cross_lane(quad)?;
             }
             // The source sits in the address field.
@@ -3523,7 +3539,9 @@ impl<'a> Lower<'a> {
                 let t = self.s.m.bin(c, Bin::Or, t, or);
                 self.s.m.bin(c, Bin::Xor, t, xor)
             };
-            let r = if mesh_quad || self.helpers_read(quad) {
+            let r = if self.portable_lanes {
+                self.portable_read_lane(x, src)
+            } else if mesh_quad || self.helpers_read(quad) {
                 self.quad_pick(x, src)
             } else {
                 self.read_lane(x, src)
@@ -6668,6 +6686,10 @@ impl<'a> Lower<'a> {
             }
             "v_readlane_b32" => {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
+                if self.portable_lanes {
+                    let r = self.portable_read_lane(a, lane);
+                    return int(self, r);
+                }
                 // A computed lane in a pixel or vertex program is a host lane
                 // (from a mask or `v_mbcnt`); a constant one is the console's.
                 if self.mask_data == MaskData::Host && !matches!(lane, V::Const(_)) {
