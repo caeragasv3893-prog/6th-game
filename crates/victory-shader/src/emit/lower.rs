@@ -677,6 +677,7 @@ impl<'a> Lower<'a> {
             let reduction = x.native.wave64 && portable_reduction_section(x);
             let scratch = reduction || insts().any(|i| {
                 i.name() == "ds_bpermute_b32" || reads_mask_as_data(x.st, i)
+                    || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
             });
             let threads = cs.threads.iter().product::<u32>();
             portable_lanes = x.native.wave64
@@ -706,7 +707,8 @@ impl<'a> Lower<'a> {
                         ),
                         // Lane-local integer arithmetic can follow a
                         // portable exchange to implement a butterfly reduction.
-                        // DPP still requires the original fixed-width path.
+                        // Uniform DPP uses the same shared scratch, with
+                        // logical lane numbering and original write masks.
                         "v_mov_b32" | "v_lshlrev_b32" | "v_add_nc_u32"
                         | "v_min_u32" | "v_max_u32" | "v_min_i32" | "v_max_i32"
                         | "v_and_b32" | "v_or_b32" | "v_xor_b32"
@@ -715,7 +717,16 @@ impl<'a> Lower<'a> {
                         // reassociate symbolic floating-point reductions.
                         | "v_add_f32" | "v_min_f32" | "v_max_f32"
                         | "v_add_f16" | "v_min_f16" | "v_max_f16" => {
-                            matches!(&i.fields, Fields::Valu(v) if v.dpp.is_none())
+                            matches!(&i.fields, Fields::Valu(v) if v.dpp.is_none()
+                                || matches!(v.src.first(), Some(Operand::Vector { .. }))
+                                    && match v.dpp {
+                                        Some(Dpp::Lanes { .. }) => true,
+                                        Some(Dpp::Row { ctrl, .. }) => matches!(ctrl,
+                                            0..=0xFF | 0x101..=0x10F | 0x111..=0x11F
+                                            | 0x121..=0x12F | 0x140 | 0x141
+                                            | 0x150..=0x16F),
+                                        None => true,
+                                    })
                         }
                         "v_cmp_gt_u32" | "v_cmp_eq_u32" => {
                             matches!(&i.fields, Fields::Valu(v) if v.dpp.is_none())
@@ -3360,6 +3371,25 @@ impl<'a> Lower<'a> {
         self.s.m.select(c, helper, own, first)
     }
 
+    /// Read a logical wave64 lane using private group scratch. Callers
+    /// must prove that every group thread reaches both barriers.
+    fn portable_read_lane(&mut self, x: V, lane: V) -> V {
+        let c = self.cur;
+        let flat = self.mesh_thread();
+        let mask = self.s.m.i32(!63u32);
+        let base = self.s.m.bin(c, Bin::And, flat, mask);
+        let src = self.s.m.bin(c, Bin::Or, base, lane);
+        let lds = self.s.lds();
+        let dst = self.s.m.element(c, lds, flat);
+        let from = self.s.m.element(c, lds, src);
+        self.s.m.store(c, dst, x);
+        let mode = self.s.m.i32(1 | 8);
+        self.s.op(c, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[mode]);
+        let r = self.s.m.load(c, from);
+        self.s.op(c, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[mode]);
+        r
+    }
+
     fn read_lane(&mut self, x: V, lane: V) -> V {
         self.s.op(
             self.cur,
@@ -3475,18 +3505,7 @@ impl<'a> Lower<'a> {
             if self.portable_lanes {
                 // Each logical wave has its own 64 consecutive scratch slots.
                 // All threads execute the store, barrier, load and barrier.
-                let flat = self.mesh_thread();
-                let mask = self.s.m.i32(!63u32);
-                let base = self.s.m.bin(c, Bin::And, flat, mask);
-                let src = self.s.m.bin(c, Bin::Or, base, lane);
-                let lds = self.s.lds();
-                let dst = self.s.m.element(c, lds, flat);
-                let from = self.s.m.element(c, lds, src);
-                self.s.m.store(c, dst, x);
-                let mode = self.s.m.i32(1 | 8);
-                self.s.op(c, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[mode]);
-                let r = self.s.m.load(c, from);
-                self.s.op(c, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[mode]);
+                let r = self.portable_read_lane(x, lane);
                 let reg = dst_reg.ok_or("a permute result")?;
                 self.write(inst, Reg::V(reg), r, guard);
                 return Ok(());
@@ -5804,7 +5823,7 @@ impl<'a> Lower<'a> {
         // Quad permutations and DPP8 stay in groups the pixel layout shares.
         let quad = matches!(dpp, Dpp::Row { ctrl: 0..=0xFF, .. });
         let mesh_quad = self.s.mesh.is_some() && quad;
-        if !mesh_quad {
+        if !mesh_quad && !self.portable_lanes {
             self.cross_lane(quad)?;
         }
         let c = self.cur;
@@ -5882,7 +5901,16 @@ impl<'a> Lower<'a> {
                 (src, inside, masks, bound_ctrl)
             }
         };
-        let mut r = if mesh_quad || self.helpers_read(quad) {
+        let mut r = if self.portable_lanes {
+            // A disabled or zero-filling row shift can produce an index
+            // outside the logical wave. Never issue that scratch load.
+            let src = if let Some(valid) = inside {
+                self.s.m.select(c, valid, src, lane)
+            } else {
+                src
+            };
+            self.portable_read_lane(x, src)
+        } else if mesh_quad || self.helpers_read(quad) {
             self.quad_pick(x, src)
         } else {
             self.read_lane(x, src)
