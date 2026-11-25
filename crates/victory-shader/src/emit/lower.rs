@@ -562,8 +562,11 @@ impl<'a> Lower<'a> {
                                 if v.dpp.is_none()
                                 && matches!(v.src.first(), Some(Operand::Const(193))))
                         }
-                        "s_mov_b32" | "s_load_dwordx4" | "s_bcnt1_i32_b64" => i.writes.iter().all(
+                        "s_mov_b32" | "s_load_dwordx4" => i.writes.iter().all(
                             |&(r, _)| matches!(r, Reg::S(0..=103)),
+                        ),
+                        "s_bcnt1_i32_b64" => i.writes.iter().all(
+                            |&(r, _)| matches!(r, Reg::S(0..=103) | Reg::Scc),
                         ),
                         "v_mov_b32" | "v_lshlrev_b32" => {
                             matches!(&i.fields, Fields::Valu(v) if v.dpp.is_none())
