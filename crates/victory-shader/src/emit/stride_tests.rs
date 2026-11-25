@@ -1071,6 +1071,126 @@ fn wave64_recognized_integer_prefix_sums_cross_warps() {
 }
 
 #[test]
+fn wave64_explicit_fp32_butterfly_preserves_operation_order() {
+    let ops = [0x03u32, 0x0f, 0x10]; // add, min, max
+    let vop2 = |op: u32, dst: u32, src0: u32, src1: u32| {
+        (op << 25) | (dst << 17) | (src1 << 9) | src0
+    };
+    let mut words = vec![
+        0xBE84_0300, 0xBE85_0380,
+        0xF408_0202, 0xFA00_0000, // load SRV descriptor s[8:11]
+        0xBE8C_0302, 0xBE8D_0380,
+        0xF408_0406, 0xFA00_0000, // load UAV descriptor s[16:19]
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+        0xBF8C_C07F,
+        0xE030_1000, 0x8002_0502, // buffer_load_dword v5, v2, s[8:11], 0 offen
+        0xBF8C_3F70,
+    ];
+    for (slot, &op) in ops.iter().enumerate() {
+        words.push(0x7E02_0305); // v_mov_b32 v1, v5
+        for distance in [1u32, 2, 4, 8, 16, 32] {
+            let bytes = distance * 4;
+            if bytes <= 64 {
+                words.push(vop2(0x1d, 3, 128 + bytes, 2));
+            } else {
+                words.extend([vop2(0x1d, 3, 255, 2), bytes]);
+            }
+            words.extend([
+                0xDACC_0000, 0x0400_0103, // ds_bpermute_b32 v4, v3, v1
+                0xBF8C_C07F,
+                vop2(op, 1, 260, 1), // preserve partner/own operand order
+            ]);
+        }
+        words.extend([
+            0xE070_1000 | (slot as u32 * 512),
+            0x8004_0102, // buffer_store_dword v1, v2, s[16:19], 0 offen
+        ]);
+    }
+    words.push(0xBF81_0000);
+    let shader = build_wave(
+        &words,
+        vec![param(RootType::Table, 0), param(RootType::Table, 2)],
+        vec![entry(ResourceType::Srv, 4, 0), entry(ResourceType::Uav, 4, 2)],
+        128,
+        true,
+    );
+    let c = crate::Container::parse(&shader.dxil).unwrap();
+    let psv = c.part(crate::FourCC::PSV0).unwrap().data;
+    assert_eq!(u32::from_le_bytes(psv[20..24].try_into().unwrap()), 0);
+    assert_eq!(u32::from_le_bytes(psv[24..28].try_into().unwrap()), u32::MAX);
+    let cases: [Vec<f32>; 3] = [
+        (0..128).map(|i| if i < 64 {
+            [16_777_216.0, 1.0, -16_777_216.0, 1.0][i % 4]
+        } else { (i as f32 - 96.0) * 0.25 }).collect(),
+        (0..128).map(|i| if i < 64 && i % 2 == 0 { -0.0 } else { 0.0 }).collect(),
+        (0..128).map(|i| if i < 64 {
+            [f32::INFINITY, f32::NEG_INFINITY, 1.0, f32::NAN][i % 4]
+        } else { [f32::NAN, 4.0, -2.0, 8.0][i % 4] }).collect(),
+    ];
+    let combine = |op: u32, a: f32, b: f32| {
+        match op {
+            0x03 => a + b,
+            0x0f | 0x10 if a == 0.0 && b == 0.0 => f32::from_bits(
+                if op == 0x0f { a.to_bits() | b.to_bits() }
+                else { a.to_bits() & b.to_bits() }
+            ),
+            0x0f => a.min(b),
+            0x10 => a.max(b),
+            _ => unreachable!(),
+        }
+    };
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host.compute_pipeline(&shader).unwrap_or_else(
+            |e| panic!("{label}: compute pipeline failed: {e}"),
+        );
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = if u.slot == 0 { 0 } else { 32 };
+        }
+        for (case, input) in cases.iter().enumerate() {
+            let bits: Vec<u32> = input.iter().map(|x| x.to_bits()).collect();
+            let views = [View::Buffer { data: &bits, stride: Stride::Raw }, View::RawUav(384)];
+            let out = host.dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud.clone()))],
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            ).unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            for (slot, &op) in ops.iter().enumerate() {
+                let mut want = input.clone();
+                for distance in [1usize, 2, 4, 8, 16, 32] {
+                    want = (0..128).map(|i| combine(op, want[i ^ distance], want[i])).collect();
+                }
+                for (lane, expected) in want.into_iter().enumerate() {
+                    let got = f32::from_bits(out[0][slot * 128 + lane]);
+                    if expected.is_nan() {
+                        assert!(got.is_nan(), "{label}: case {case}, op {op:x}, lane {lane}");
+                    } else {
+                        assert_eq!(got.to_bits(), expected.to_bits(),
+                            "{label}: case {case}, op {op:x}, lane {lane}");
+                    }
+                }
+            }
+        }
+        eprintln!("{label}: explicit wave64 FP32 add/min/max passed");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+#[test]
 fn a_half_buffer_load_by_index_reads_the_structured_element() {
     let mut code = HALF_LOAD_WAVE32.to_vec();
     // buffer_load_ushort v2, v0, s[8:11], 0 idxen offset:6.
