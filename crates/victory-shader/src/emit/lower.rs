@@ -241,6 +241,8 @@ struct Lower<'a> {
     console_lanes: bool,
     /// Straight-line wave64 code with portable numbering and optional LDS exchange.
     portable_lanes: bool,
+    /// Alternating private LDS bank for a proven straight-line exchange sequence.
+    portable_exchange_bank: Option<u32>,
     /// Pixel: an ordered section (POPS), whose UAVs the host makes
     /// rasterizer-ordered views.
     pops: bool,
@@ -689,6 +691,7 @@ impl<'a> Lower<'a> {
             || insts().any(|i| i.name().starts_with("image_bvh"));
         let mut console_lanes = false;
         let mut portable_lanes = false;
+        let mut portable_exchange_bank = None;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -870,9 +873,26 @@ impl<'a> Lower<'a> {
                     }
                 }));
             if portable_lanes && scratch {
-                // The entire group's scratch is private to this lowering.
-                // Reuse it only after all readers have reached the second barrier.
-                s.lds_dwords = threads;
+                // Only a straight-line sequence with no other scratch users
+                // can leave a read pending at the end of an exchange.
+                let exchange_sequence = !reduction
+                    && p.blocks.len() == 1
+                    && matches!(p.blocks[0].exit, Exit::End)
+                    && super::wave::sections(p, 0).is_empty()
+                    && insts().all(|i| {
+                        !reads_mask_as_data(x.st, i)
+                            && !matches!(i.name(), "s_bcnt1_i32_b64"
+                                | "v_mbcnt_lo_u32_b32" | "v_mbcnt_hi_u32_b32")
+                    });
+                // Two banks need at most 8 KiB for 1024 group threads.
+                // Recognized scans/extrema also use them, with a trailing
+                // barrier to make their scratch available to other operations.
+                s.lds_dwords = if exchange_sequence || reduction {
+                    2 * threads
+                } else {
+                    threads
+                };
+                portable_exchange_bank = exchange_sequence.then_some(0);
             }
             if !portable_lanes && (console_lanes || one_wave && s.lds_dwords > 0) {
                 s.wave_size = Some(wave);
@@ -967,6 +987,7 @@ impl<'a> Lower<'a> {
             src0: None,
             console_lanes,
             portable_lanes,
+            portable_exchange_bank,
             pops: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
                 if db_shader_control & 1 << 16 != 0),
             root_memory,
@@ -2242,29 +2263,43 @@ impl<'a> Lower<'a> {
 
     /// Uniform inclusive/exclusive scan of a logical wave. Each round
     /// reads the previous round's value from a lower-numbered lane.
-    /// Two group barriers separate publication, reading and scratch reuse.
+    /// Alternating banks need one publication barrier per round and a
+    /// final retirement barrier; the single-bank fallback uses two per round.
     fn portable_prefix_sum(&mut self, value: V, inclusive: bool) -> V {
         let c = self.cur;
         let flat = self.mesh_thread();
         let mask = self.s.m.i32(63);
         let lane = self.s.m.bin(c, Bin::And, flat, mask);
         let lds = self.s.lds();
-        let own = self.s.m.element(c, lds, flat);
+        let threads = self.s.threads.expect("portable compute").iter().product::<u32>();
+        let double_buffer = self.s.lds_dwords >= 2 * threads;
         let mode = self.s.m.i32(1 | 8);
         let zero = self.s.m.i32(0);
         let mut sum = value;
-        for d in [1, 2, 4, 8, 16, 32] {
+        for (round, d) in [1, 2, 4, 8, 16, 32].into_iter().enumerate() {
             let distance = self.s.m.i32(d);
             let valid = self.s.m.cmp(c, pred::IUGE, lane, distance);
             let prior = self.s.m.bin(c, Bin::Sub, flat, distance);
             let index = self.s.m.select(c, valid, prior, flat);
+            let (own, index) = if double_buffer && round % 2 == 1 {
+                let offset = self.s.m.i32(threads);
+                (self.s.m.bin(c, Bin::Add, flat, offset), self.s.m.bin(c, Bin::Add, index, offset))
+            } else {
+                (flat, index)
+            };
+            let own = self.s.m.element(c, lds, own);
             let src = self.s.m.element(c, lds, index);
             self.s.m.store(c, own, sum);
             self.s.op(c, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[mode]);
             let x = self.s.m.load(c, src);
-            self.s.op(c, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[mode]);
+            if !double_buffer {
+                self.s.op(c, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[mode]);
+            }
             let x = self.s.m.select(c, valid, x, zero);
             sum = self.s.m.bin(c, Bin::Add, sum, x);
+        }
+        if double_buffer {
+            self.s.op(c, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[mode]);
         }
         if inclusive { sum } else { self.s.m.bin(c, Bin::Sub, sum, value) }
     }
@@ -2396,12 +2431,12 @@ impl<'a> Lower<'a> {
         let c = self.cur;
         let flat = self.mesh_thread();
         let lds = self.s.lds();
-        let own = self.s.m.element(c, lds, flat);
         let mode = self.s.m.i32(1 | 8);
         let threads = self.s.threads.expect("portable compute").iter().product::<u32>();
+        let double_buffer = self.s.lds_dwords >= 2 * threads;
         let end = (!threads.is_multiple_of(64)).then(|| self.s.m.i32(threads));
         let mut bits = value;
-        for distance in [1, 2, 4, 8, 16, 32] {
+        for (round, distance) in [1, 2, 4, 8, 16, 32].into_iter().enumerate() {
             let d = self.s.m.i32(distance);
             let partner = self.s.m.bin(c, Bin::Xor, flat, d);
             // In a partial wave, choose the first lane of the partner
@@ -2415,6 +2450,13 @@ impl<'a> Lower<'a> {
             } else {
                 (partner, None)
             };
+            let (own, partner) = if double_buffer && round % 2 == 1 {
+                let offset = self.s.m.i32(threads);
+                (self.s.m.bin(c, Bin::Add, flat, offset), self.s.m.bin(c, Bin::Add, partner, offset))
+            } else {
+                (flat, partner)
+            };
+            let own = self.s.m.element(c, lds, own);
             let src = self.s.m.element(c, lds, partner);
             self.s.m.store(c, own, bits);
             self.s.op(c, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[mode]);
@@ -2424,11 +2466,16 @@ impl<'a> Lower<'a> {
             } else {
                 other
             };
-            self.s.op(c, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[mode]);
+            if !double_buffer {
+                self.s.op(c, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[mode]);
+            }
             let a = self.as_float(other);
             let b = self.as_float(bits);
             let result = self.max_min(max, a, b);
             bits = self.as_int(result);
+        }
+        if double_buffer {
+            self.s.op(c, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[mode]);
         }
         bits
     }
@@ -3613,7 +3660,10 @@ impl<'a> Lower<'a> {
     }
 
     /// Read a logical wave64 lane using private group scratch. Callers
-    /// must prove that every group thread reaches both barriers.
+    /// must prove that every group thread reaches the publication barrier.
+    /// Straight-line exchanges alternate banks: the next publication
+    /// barrier also retires the previous bank's readers before its reuse.
+    /// Other paths keep the original trailing barrier.
     fn portable_read_lane(&mut self, x: V, lane: V) -> V {
         let c = self.cur;
         let flat = self.mesh_thread();
@@ -3633,13 +3683,27 @@ impl<'a> Lower<'a> {
             src
         };
         let lds = self.s.lds();
-        let dst = self.s.m.element(c, lds, flat);
+        let bank = self.portable_exchange_bank;
+        let (dst, src) = if let Some(bank) = bank {
+            self.portable_exchange_bank = Some(1 - bank);
+            if bank == 0 {
+                (flat, src)
+            } else {
+                let offset = self.s.m.i32(threads);
+                (self.s.m.bin(c, Bin::Add, flat, offset), self.s.m.bin(c, Bin::Add, src, offset))
+            }
+        } else {
+            (flat, src)
+        };
+        let dst = self.s.m.element(c, lds, dst);
         let from = self.s.m.element(c, lds, src);
         self.s.m.store(c, dst, x);
         let mode = self.s.m.i32(1 | 8);
         self.s.op(c, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[mode]);
         let r = self.s.m.load(c, from);
-        self.s.op(c, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[mode]);
+        if bank.is_none() {
+            self.s.op(c, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[mode]);
+        }
         if let Some(on) = valid {
             let zero = self.s.m.i32(0);
             self.s.m.select(c, on, r, zero)
@@ -3764,9 +3828,10 @@ impl<'a> Lower<'a> {
             let lane = self.s.m.bin(c, Bin::And, lane, last);
             if self.portable_lanes {
                 // Each logical wave has its own 64 consecutive scratch slots.
-                // All threads execute the store, barrier, load and barrier.
-                // Inactive lanes publish zero but still participate in
-                // both barriers. Their destination is preserved by write().
+                // All threads execute the store, publication barrier and
+                // load (plus a retirement barrier when not alternating banks).
+                // Inactive lanes publish zero but still participate.
+                // Their destination is preserved by write().
                 let x = if let Some(on) = guard {
                     let zero = self.s.m.i32(0);
                     self.s.m.select(c, on, x, zero)
