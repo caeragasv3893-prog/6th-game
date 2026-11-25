@@ -498,8 +498,12 @@ by this portable path.
 The new synthetic test checks two logical waves in a 128-thread group,
 two distinct comparisons, both mask words and a population count, with
 three dispatches per available hardware/WARP adapter. Independent
-reference arithmetic checked all 256 predicate bits. Compilation,
-DXIL validation and GPU execution remain pending.
+reference arithmetic checked all 256 predicate bits. Windows validation
+at revision `2c18b44` passed all five targeted wave64 tests (0.62 s).
+Both hardware and WARP explicitly passed the two mask words, population
+count and scratch reuse regression. Strict all-features Clippy passed
+in 3.43 s. Full workspace regression, release validation and ballot
+performance measurements remain pending.
 
 ```powershell
 cargo test -p victory-shader --lib --locked wave64_ -- --test-threads=1 --nocapture
