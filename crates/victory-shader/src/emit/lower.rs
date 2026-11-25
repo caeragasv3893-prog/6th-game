@@ -60,6 +60,12 @@ pub(crate) struct Lowered {
     /// Heap handles written.
     #[cfg(test)]
     pub heap_handles: u32,
+    /// Group barriers actually emitted after bitcode liveness filtering.
+    #[cfg(test)]
+    pub barrier_calls: usize,
+    /// Allocated group scratch size, in dwords.
+    #[cfg(test)]
+    pub scratch_dwords: u32,
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
@@ -1769,6 +1775,10 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             heap_handles: self.s.m.written_calls("dx.op.createHandleFromHeap") as u32,
+            #[cfg(test)]
+            barrier_calls: self.s.m.written_calls("dx.op.barrier"),
+            #[cfg(test)]
+            scratch_dwords: self.s.lds_dwords,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
