@@ -595,18 +595,19 @@ pub(crate) fn ordered_sum(
     saved: Value,
     identity: u32,
 ) -> Option<OrderedSum> {
-    ordered_graph(insts, result, source, saved, identity, false)
+    ordered_graph(insts, result, source, saved, identity, None)
 }
 
-/// Preserve the actual addition graph for each lane of an inclusive prefix.
+/// Preserve the actual addition graph for each lane of a prefix.
 pub(crate) fn ordered_prefix(
     insts: &[Inst],
     result: Value,
     source: Value,
     saved: Value,
     identity: u32,
+    inclusive: bool,
 ) -> Option<OrderedSum> {
-    ordered_graph(insts, result, source, saved, identity, true)
+    ordered_graph(insts, result, source, saved, identity, Some(inclusive))
 }
 
 fn ordered_graph(
@@ -615,7 +616,7 @@ fn ordered_graph(
     source: Value,
     saved: Value,
     identity: u32,
-    prefix: bool,
+    prefix: Option<bool>,
 ) -> Option<OrderedSum> {
     if insts.len() > 128 {
         return None;
@@ -632,7 +633,7 @@ fn ordered_graph(
     };
     for inst in insts {
         if inst.write(Reg::S(EXEC)).is_some() {
-            if !prefix || !matches!(inst.name(), "s_mov_b32" | "s_mov_b64") {
+            if prefix.is_none() || !matches!(inst.name(), "s_mov_b32" | "s_mov_b64") {
                 return None;
             }
             let k = constant(inst)?;
@@ -644,7 +645,7 @@ fn ordered_graph(
             continue;
         }
         if inst.write(Reg::S(EXEC + 1)).is_some() {
-            if !prefix || inst.name() != "s_mov_b32" {
+            if prefix.is_none() || inst.name() != "s_mov_b32" {
                 return None;
             }
             exec = (exec & 0xFFFF_FFFF) | ((constant(inst)? & 0xFFFF_FFFF) << 32);
@@ -683,7 +684,15 @@ fn ordered_graph(
             }
             std::array::from_fn(Some)
         } else {
-            let a = read(v.src.first()?)?;
+            // An exclusive prefix may insert the exact zero identity by
+            // a move, never by removing a term with floating subtraction.
+            let a = if prefix == Some(false) && inst.name() == "v_mov_b32"
+                && identity == 0 && imm(v.src.first()?) == Some(0) && v.dpp.is_none()
+            {
+                [Some(usize::MAX); 64]
+            } else {
+                read(v.src.first()?)?
+            };
             let b = match inst.name() {
                 "v_mov_b32" => None,
                 "v_add_f32" => Some(read(v.src.get(1)?)?),
@@ -714,6 +723,9 @@ fn ordered_graph(
                 *out = if let Some(b) = b {
                     match (lhs, b[lane]) {
                         (Some(lhs), Some(rhs)) => {
+                            if lhs == usize::MAX || rhs == usize::MAX {
+                                return None;
+                            }
                             let key = (lhs, rhs);
                             let node = *intern.entry(key).or_insert_with(|| {
                                 let node = 64 + adds.len();
@@ -735,7 +747,7 @@ fn ordered_graph(
     for (root, lane) in roots.iter_mut().zip(lanes) {
         *root = (*lane)?;
     }
-    if prefix {
+    if let Some(inclusive) = prefix {
         // Independently prove that each result includes exactly its prefix.
         // Repeated inputs are not valid sum terms.
         let mut masks: Vec<u64> = (0..64).map(|lane| 1u64 << lane).collect();
@@ -744,8 +756,19 @@ fn ordered_graph(
             masks.push(if a == 0 || b == 0 || a & b != 0 { 0 } else { a | b });
         }
         for (lane, &root) in roots.iter().enumerate() {
-            if masks[root] != u64::MAX >> (63 - lane) {
-                return None;
+            if !inclusive && lane == 0 {
+                if root != usize::MAX || identity != 0 {
+                    return None;
+                }
+            } else {
+                let expected = if inclusive {
+                    u64::MAX >> (63 - lane)
+                } else {
+                    (1u64 << lane) - 1
+                };
+                if root == usize::MAX || masks[root] != expected {
+                    return None;
+                }
             }
         }
     } else if roots[0] < 64 || !roots.iter().all(|&n| n == roots[0]) {
