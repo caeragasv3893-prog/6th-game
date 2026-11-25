@@ -1150,7 +1150,11 @@ fn wave64_recognized_fp32_inclusive_prefix_preserves_association() {
         for base in [16usize, 32, 48] {
             let prior = row[base - 1];
             for x in &mut row[base..base + 16] {
-                *x = prior + *x;
+                // Keep the shader's operand order, including for NaNs.
+                #[allow(clippy::assign_op_pattern)]
+                {
+                    *x = prior + *x;
+                }
             }
         }
         row
