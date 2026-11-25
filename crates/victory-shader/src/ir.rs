@@ -309,7 +309,17 @@ pub fn build_bounded(
     })
 }
 
-/// An EXECZ skip over register-only exchanges has no effect when EXEC
+/// Lane-local register-only operations admitted alongside a predicated
+/// exchange. No DPP, SDWA, scalar result or memory side effect.
+pub(crate) fn predicated_exchange_alu(name: &str, fields: &Fields) -> bool {
+    matches!(name, "v_mov_b32" | "v_add_nc_u32")
+        && matches!(fields, Fields::Valu(v)
+            if v.dpp.is_none() && v.sdwa.is_none()
+                && matches!(v.dst, Some(Operand::Vector { .. }))
+                && !v.clamp && v.omod == 0)
+}
+
+/// An EXECZ skip over register-only exchanges and local ALU has no effect when EXEC
 /// is empty: no VGPR is written. Keeping the masked exchanges in the
 /// straight-line IR lets a portable backend synchronize the entire group.
 /// Restrict this to otherwise linear programs, with an immediate full
@@ -338,7 +348,8 @@ fn empty_exec_exchange_skips(list: &[Instruction], flows: &[Flow]) -> Vec<bool> 
                         match list[n].name() {
                             Some("ds_bpermute_b32") => matches!(list[n].fields(true), Fields::Ds { gds: false, .. }),
                             Some("s_waitcnt" | "s_nop") => true,
-                            _ => false,
+                            Some(name) => predicated_exchange_alu(name, &list[n].fields(true)),
+                            None => false,
                         })
                 {
                     return none();
@@ -1157,6 +1168,12 @@ mod tests {
         assert_eq!(p.blocks.len(), 1);
         assert!(p.blocks[0].insts.iter().any(|i| i.name() == "ds_bpermute_b32"));
         assert!(!p.blocks[0].insts.iter().any(|i| i.name() == "s_cbranch_execz"));
+        let mut with_alu = words.to_vec();
+        with_alu[1] = 0xBF88_0004;
+        with_alu.insert(5, 0x4A06_0681); // v_add_nc_u32 v3, 1, v3
+        let p = build_words(&with_alu, true);
+        assert_eq!(p.blocks.len(), 1);
+        assert!(p.blocks[0].insts.iter().any(|i| i.name() == "v_add_nc_u32"));
         assert!(build_words(&words, false).blocks.len() > 1);
         let mut scalar = words;
         scalar[4] = 0xBE94_0381; // an EXEC-independent scalar write
