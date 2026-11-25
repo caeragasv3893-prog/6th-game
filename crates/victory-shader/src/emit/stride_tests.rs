@@ -1818,6 +1818,17 @@ fn wave64_explicit_fp32_butterfly_preserves_operation_order() {
 
 #[test]
 fn wave64_recognized_fp32_extrema_across_warps() {
+    check_fp32_extrema(128);
+}
+
+#[test]
+fn wave64_recognized_fp32_extrema_partial_groups() {
+    for threads in [1, 17, 33, 63, 65, 96, 127] {
+        check_fp32_extrema(threads);
+    }
+}
+
+fn check_fp32_extrema(threads: u32) {
     use super::wave::{Op, Shape};
     let vop3 = |dst: u32, op: u32, a: u32, b: u32, c: u32| {
         [0xD400_0000 | (op << 16) | dst, a | (b << 9) | (c << 18)]
@@ -1872,7 +1883,7 @@ fn wave64_recognized_fp32_extrema_across_warps() {
             &words,
             vec![param(RootType::Table, 0), param(RootType::Table, 2)],
             vec![entry(ResourceType::Srv, 4, 0), entry(ResourceType::Uav, 4, 2)],
-            128,
+            threads,
             true,
         );
         let c = crate::Container::parse(&shader.dxil).unwrap();
@@ -1916,24 +1927,27 @@ fn wave64_recognized_fp32_extrema_across_warps() {
                     &pso,
                     &Dispatch {
                         roots: vec![(0, Root::Constants(ud.clone()))],
-                        views: &[View::Buffer { data: &bits, stride: Stride::Raw }, View::RawUav(128)],
+                        views: &[View::Buffer { data: &bits, stride: Stride::Raw }, View::RawUav(threads)],
                         samplers: &[],
                         groups: [1, 1, 1],
                     },
                 ).unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
-                for base in [0usize, 64] {
-                    let expected = input[base..base + 64].iter().copied().reduce(reference).unwrap();
-                    for &bits in &out[0][base..base + 64] {
+                for base in (0..threads as usize).step_by(64) {
+                    let end = (base + 64).min(threads as usize);
+                    let mut padded = [identity; 64];
+                    padded[..end - base].copy_from_slice(&input[base..end]);
+                    let expected = padded.into_iter().reduce(reference).unwrap();
+                    for &bits in &out[0][base..end] {
                         let got = f32::from_bits(bits);
                         if expected.is_nan() {
-                            assert!(got.is_nan(), "{label}: {op:?}, case {case}");
+                            assert!(got.is_nan(), "{label}: {op:?}, case {case}, threads={threads}");
                         } else {
-                            assert_eq!(bits, expected.to_bits(), "{label}: {op:?}, case {case}");
+                            assert_eq!(bits, expected.to_bits(), "{label}: {op:?}, case {case}, threads={threads}");
                         }
                     }
                 }
             }
-            eprintln!("{label}: recognized wave64 {op:?} passed");
+            eprintln!("{label}: recognized wave64 {op:?} passed (threads={threads})");
             ran += 1;
         }
         assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
@@ -1942,6 +1956,17 @@ fn wave64_recognized_fp32_extrema_across_warps() {
 
 #[test]
 fn wave64_recognized_fp16_sum_rounds_each_step() {
+    check_fp16_sum(128);
+}
+
+#[test]
+fn wave64_recognized_fp16_sum_partial_groups() {
+    for threads in [1, 15, 16, 17, 33, 63, 65, 66, 67, 80, 96, 127] {
+        check_fp16_sum(threads);
+    }
+}
+
+fn check_fp16_sum(threads: u32) {
     use super::wave::{Op, Shape};
     let vop3 = |dst: u32, op: u32, a: u32, b: u32, c: u32| {
         [0xD400_0000 | (op << 16) | dst, a | (b << 9) | (c << 18)]
@@ -1993,7 +2018,7 @@ fn wave64_recognized_fp16_sum_rounds_each_step() {
         &words,
         vec![param(RootType::Table, 0), param(RootType::Table, 2)],
         vec![entry(ResourceType::Srv, 4, 0), entry(ResourceType::Uav, 4, 2)],
-        128,
+        threads,
         true,
     );
     let c = crate::Container::parse(&shader.dxil).unwrap();
@@ -2004,12 +2029,27 @@ fn wave64_recognized_fp16_sum_rounds_each_step() {
         let half = if i < 64 {
             [0x3c00, 0x4000, 0x4400, 0x4800][i as usize % 4]
         } else {
-            match i { 64 => 0x6800, 65 => 0x3c00, _ => 0 }
+            match i { 64 => 0x6800, 65 => 0x3c00, 66 => 0xe800, _ => 0 }
         };
         ((0xa000 + i) << 16) | half
     }).collect();
-    // 240 exactly, and 2048 + 1 rounded to 2048 at the first add.
-    let expected = [0xa00f_5b80, 0xa04f_6800];
+    // The first wave contains exact small integers. The second contains
+    // 2048 + 1 - 2048: the original pairwise graph rounds to zero, whereas
+    // rounding only once would produce one. An absent high-half source
+    // has the masked input identity (zero).
+    let expected = |base: u32| {
+        let n = (threads - base).min(64);
+        let low = if base == 0 {
+            let total: u32 = (0..n).map(|i| [1, 2, 4, 8][i as usize % 4]).sum();
+            ((total as f32).to_bits() >> 13) - 0x1c000
+        } else if n < 3 {
+            0x6800
+        } else {
+            0
+        };
+        let high = if n >= 16 { (0xa000 + base + 15) << 16 } else { 0 };
+        high | low
+    };
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
         let Ok(host) = Host::new(warp) else {
@@ -2027,15 +2067,15 @@ fn wave64_recognized_fp16_sum_rounds_each_step() {
             &root, &pso,
             &Dispatch {
                 roots: vec![(0, Root::Constants(ud))],
-                views: &[View::Buffer { data: &input, stride: Stride::Raw }, View::RawUav(128)],
+                views: &[View::Buffer { data: &input, stride: Stride::Raw }, View::RawUav(threads)],
                 samplers: &[],
                 groups: [1, 1, 1],
             },
         ).unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
         for (lane, &bits) in out[0].iter().enumerate() {
-            assert_eq!(bits, expected[lane / 64], "{label}: FP16 sum lane {lane}");
+            assert_eq!(bits, expected((lane as u32) & !63), "{label}: FP16 sum lane {lane}, threads={threads}");
         }
-        eprintln!("{label}: recognized ordered wave64 FP16 sum passed");
+        eprintln!("{label}: recognized ordered wave64 FP16 sum passed (threads={threads})");
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
@@ -2043,6 +2083,17 @@ fn wave64_recognized_fp16_sum_rounds_each_step() {
 
 #[test]
 fn wave64_recognized_fp32_sum_preserves_association() {
+    check_fp32_sum(128);
+}
+
+#[test]
+fn wave64_recognized_fp32_sum_partial_groups() {
+    for threads in [1, 15, 17, 33, 63, 65, 96, 127] {
+        check_fp32_sum(threads);
+    }
+}
+
+fn check_fp32_sum(threads: u32) {
     use super::wave::{Op, Shape};
     let vop3 = |dst: u32, op: u32, a: u32, b: u32, c: u32| {
         [0xD400_0000 | (op << 16) | dst, a | (b << 9) | (c << 18)]
@@ -2094,7 +2145,7 @@ fn wave64_recognized_fp32_sum_preserves_association() {
         &words,
         vec![param(RootType::Table, 0), param(RootType::Table, 2)],
         vec![entry(ResourceType::Srv, 4, 0), entry(ResourceType::Uav, 4, 2)],
-        128,
+        threads,
         true,
     );
     let c = crate::Container::parse(&shader.dxil).unwrap();
@@ -2146,24 +2197,27 @@ fn wave64_recognized_fp32_sum_preserves_association() {
                 &pso,
                 &Dispatch {
                     roots: vec![(0, Root::Constants(ud.clone()))],
-                    views: &[View::Buffer { data: &bits, stride: Stride::Raw }, View::RawUav(128)],
+                    views: &[View::Buffer { data: &bits, stride: Stride::Raw }, View::RawUav(threads)],
                     samplers: &[],
                     groups: [1, 1, 1],
                 },
             ).unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
-            for base in [0usize, 64] {
-                let expected = reference(&input[base..base + 64]);
-                for &bits in &out[0][base..base + 64] {
+            for base in (0..threads as usize).step_by(64) {
+                let end = (base + 64).min(threads as usize);
+                let mut padded = [0.0; 64];
+                padded[..end - base].copy_from_slice(&input[base..end]);
+                let expected = reference(&padded);
+                for &bits in &out[0][base..end] {
                     let got = f32::from_bits(bits);
                     if expected.is_nan() {
-                        assert!(got.is_nan(), "{label}: {op:?}, case {case}");
+                        assert!(got.is_nan(), "{label}: {op:?}, case {case}, threads={threads}");
                     } else {
-                        assert_eq!(bits, expected.to_bits(), "{label}: {op:?}, case {case}");
+                        assert_eq!(bits, expected.to_bits(), "{label}: {op:?}, case {case}, threads={threads}");
                     }
                 }
             }
         }
-        eprintln!("{label}: recognized ordered wave64 FP32 sum passed");
+        eprintln!("{label}: recognized ordered wave64 FP32 sum passed (threads={threads})");
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
