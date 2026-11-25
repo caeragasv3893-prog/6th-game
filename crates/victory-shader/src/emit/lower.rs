@@ -530,7 +530,7 @@ fn portable_reduction_section(x: &Parts<'_>, partial: bool) -> bool {
                         live = true;
                     }
                     Some(Shape::Prefix(Op::AddF, src, mask, ident, inclusive))
-                        if !partial && *mask == saved && !defined.contains(src)
+                        if (!partial || *ident == 0) && *mask == saved && !defined.contains(src)
                             && super::wave::ordered_prefix(inside, v, *src, saved, *ident, *inclusive).is_some() => {
                         live = true;
                     }
@@ -681,8 +681,9 @@ impl<'a> Lower<'a> {
             // operations retain complete-wave and full-EXEC restrictions;
             // every thread must reach the group barriers.
             let threads = cs.threads.iter().product::<u32>();
-            // Integer reductions and prefixes have exact identities for
-            // missing lanes; ordered FP32/FP16 graphs still need full waves.
+            // Integer reductions and prefixes admit partial waves.
+            // Proven FP32 prefixes only depend on earlier existing lanes;
+            // ordered whole-wave FP32/FP16 sums still need full waves.
             let reduction = x.native.wave64
                 && portable_reduction_section(x, !threads.is_multiple_of(64));
             let scratch = reduction || insts().any(|i| {
@@ -2212,12 +2213,29 @@ impl<'a> Lower<'a> {
         let mut values = vec![None; needed.len()];
         let mut high_word = None;
         let low = self.s.m.i32(0xFFFF);
+        let threads = self.s.threads.expect("portable compute").iter().product::<u32>();
+        // Only proven prefix graphs can reach this path with a partial
+        // group. Their live lane roots never depend on missing leaves.
+        // Give other roots defined inputs without out-of-bounds LDS loads.
+        let end = (!threads.is_multiple_of(64)).then(|| self.s.m.i32(threads));
         for lane in 0..64 {
             if needed[lane] {
                 let k = self.s.m.i32(lane as u32);
                 let index = self.s.m.bin(c, Bin::Or, base, k);
+                let present = end.map(|end| self.s.m.cmp(c, pred::IULT, index, end));
+                let index = if let Some(on) = present {
+                    self.s.m.select(c, on, index, flat)
+                } else {
+                    index
+                };
                 let ptr = self.s.m.element(c, lds, index);
                 let bits = self.s.m.load(c, ptr);
+                let bits = if let Some(on) = present {
+                    let zero = self.s.m.i32(0);
+                    self.s.m.select(c, on, bits, zero)
+                } else {
+                    bits
+                };
                 if half_hi == Some(lane as u32) {
                     high_word = Some(bits);
                 }
