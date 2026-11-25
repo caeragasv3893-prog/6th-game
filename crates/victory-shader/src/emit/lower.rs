@@ -4306,6 +4306,12 @@ impl<'a> Lower<'a> {
         let stride = self.s.m.i32(stride);
         let element = self.s.m.bin(c, Bin::UDiv, at, stride);
         let within = self.s.m.bin(c, Bin::URem, at, stride);
+        self.structured_element_dword(h, element, within)
+    }
+
+    /// A dword in an explicitly indexed structured SRV or UAV element.
+    fn structured_element_dword(&mut self, h: V, element: V, within: V) -> V {
+        let c = self.cur;
         let (mask, align) = (self.s.m.i8(1), self.s.m.i32(4));
         let r = self.s.op(
             c,
@@ -9083,12 +9089,18 @@ impl<'a> Lower<'a> {
         if let Some((width, signed)) = sub {
             // The dword holding the field, as `global_load_ubyte` and kin.
             // shortcut: the field is taken not to cross a dword.
-            if index.is_some() {
-                return Err("a byte or half buffer load by index");
-            }
             let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
             let at = self.s.m.bin(c, Bin::And, off, not3);
-            let w = if let Some(used) = used
+            let w = if let Some(index) = index {
+                // A structured access keeps the explicit element index,
+                // rather than flattening it into a raw byte address.
+                let stride = used.map_or(0, |u| u.stride);
+                if stride < 4 || !stride.is_multiple_of(4) {
+                    return Err("a structured sub-dword buffer load of unknown stride");
+                }
+                let h = self.handle(site, src, false, (12 | u, stride))?;
+                self.structured_element_dword(h, index, at)
+            } else if let Some(used) = used
                 && used.root == RootType::Table
                 && used.kind == ResourceType::Srv
                 && used.stride >= 4
