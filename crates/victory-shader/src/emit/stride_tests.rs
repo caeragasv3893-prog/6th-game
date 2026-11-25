@@ -246,6 +246,8 @@ fn a_heap_buffer_read_by_element_takes_the_views_stride() {
             data: &data,
             stride: Stride::Structured(12),
         },
+        // The same bytes through the host's raw companion descriptor.
+        View::Buffer { data: &data, stride: Stride::Raw },
     ];
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
@@ -281,7 +283,7 @@ fn a_heap_buffer_read_by_element_takes_the_views_stride() {
                             1,
                             Root::View {
                                 srv: true,
-                                data: vec![4, 12],
+                                data: vec![4, 12 | (3 << 12), 4],
                             },
                         ),
                     ],
