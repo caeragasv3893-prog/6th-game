@@ -65,6 +65,10 @@ fn program(whole: bool) -> Vec<u32> {
 }
 
 fn build(words: &[u32]) -> Result<HostShader, crate::ShaderError> {
+    build_with_input_stride(words, 16)
+}
+
+fn build_with_input_stride(words: &[u32], input_stride: u32) -> Result<HostShader, crate::ShaderError> {
     let range = |kind, table_offset_dwords, dwords, stride| UsedResource {
         kind,
         root: RootType::Table,
@@ -89,7 +93,7 @@ fn build(words: &[u32]) -> Result<HostShader, crate::ShaderError> {
         }],
         used: vec![
             range(ResourceType::Srv, 0, 8, 0),
-            range(ResourceType::Srv, 8, 4, 16),
+            range(ResourceType::Srv, 8, 4, input_stride),
             range(ResourceType::Uav, 16, 4, 0),
         ],
         io: StageIo::Cs(ComputeIo {
@@ -151,8 +155,7 @@ fn gathers_at_a_level_match_the_hardware() {
     check_gathers_at_a_level(Stride::Structured(16));
 }
 
-// Diagnostic: isolate the gather lowering from a raw shader load through
-// a structured descriptor, which is not portable across host adapters.
+// Cover the equivalent raw input path with matching resource metadata.
 #[test]
 fn gathers_at_a_level_with_raw_input() {
     check_gathers_at_a_level(Stride::Raw);
@@ -211,7 +214,12 @@ fn check_gathers_at_a_level(input_stride: Stride) {
         records.push([offset, u.to_bits(), v.to_bits(), level]);
     }
     let input: Vec<u32> = records.iter().flatten().copied().collect();
-    let shader = build(&program(true)).expect("lower");
+    let stride = match input_stride {
+        Stride::Raw => 0,
+        Stride::Structured(s) => s,
+        _ => unreachable!("gather input must be raw or structured"),
+    };
+    let shader = build_with_input_stride(&program(true), stride).expect("lower");
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())
             .expect("DXIL validation failed");
