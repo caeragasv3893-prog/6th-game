@@ -2,7 +2,7 @@
 //!
 //! Every machine instruction becomes one [`Inst`], except scheduling-only
 //! ones (`s_nop`, `s_waitcnt*`, `s_inst_prefetch`...) and redundant conditional
-//! branches.
+//! branches, including proven empty-EXEC skips over register-only exchanges.
 //! Each register dword is a variable: a read names the [`Value`] it sees, a
 //! write defines a new one, and [`Phi`]s merge values where control flow
 //! joins. Nothing is raised: an instruction keeps its opcode and decoded
@@ -143,11 +143,23 @@ pub fn build_bounded(
     let isa = |offset, reason| ShaderError::Isa { offset, reason };
 
     let mut flows = Vec::with_capacity(list.len());
-    let mut leaders = vec![0];
-    for (i, inst) in list.iter().enumerate() {
-        let flow = gfx10::control(inst, code.len(), |at| {
+    for inst in &list {
+        flows.push(gfx10::control(inst, code.len(), |at| {
             list[..list.partition_point(|i| i.offset < at)].last()
-        })?;
+        })?);
+    }
+    let elided = if wave64 {
+        empty_exec_exchange_skips(&list, &flows)
+    } else {
+        vec![false; list.len()]
+    };
+    for (flow, &skip) in flows.iter_mut().zip(&elided) {
+        if skip {
+            *flow = Flow::Next;
+        }
+    }
+    let mut leaders = vec![0];
+    for (i, &flow) in flows.iter().enumerate() {
         if let Flow::Jump(t) | Flow::Branch(t) = flow {
             leaders.push(t);
         }
@@ -156,7 +168,6 @@ pub fn build_bounded(
         {
             leaders.push(next.offset);
         }
-        flows.push(flow);
     }
     leaders.sort_unstable();
     leaders.dedup();
@@ -179,7 +190,10 @@ pub fn build_bounded(
     let next_offsets: Vec<Option<usize>> = (0..list.len())
         .map(|i| list.get(i + 1).map(|n| n.offset))
         .collect();
-    for ((machine, flow), next) in list.into_iter().zip(flows).zip(next_offsets) {
+    for (((machine, flow), next), skip) in list.into_iter().zip(flows).zip(next_offsets).zip(elided) {
+        if skip {
+            continue;
+        }
         let b = leaders.partition_point(|&l| l <= machine.offset) - 1;
         let name = machine.name().ok_or(ShaderError::Unsupported {
             offset: machine.offset,
@@ -293,6 +307,48 @@ pub fn build_bounded(
         blocks,
         inputs,
     })
+}
+
+/// An EXECZ skip over register-only exchanges has no effect when EXEC
+/// is empty: no VGPR is written. Keeping the masked exchanges in the
+/// straight-line IR lets a portable backend synchronize the entire group.
+/// Restrict this to otherwise linear programs, with an immediate full
+/// EXEC restore at every target; no alternate entry, scalar side effect,
+/// memory write, call or loop can be hidden by the transformation.
+fn empty_exec_exchange_skips(list: &[Instruction], flows: &[Flow]) -> Vec<bool> {
+    let mut elided = vec![false; list.len()];
+    let none = || vec![false; list.len()];
+    let restore = |i: &Instruction| {
+        i.name() == Some("s_mov_b64")
+            && matches!(i.fields(true),
+                Fields::Sop { dst: Some(Operand::Scalar { code: EXEC, .. }), src, .. }
+                    if matches!(src.first(), Some(Operand::Const(193))))
+    };
+    for (i, &flow) in flows.iter().enumerate() {
+        match flow {
+            Flow::Next => {}
+            Flow::Stop if i + 1 == list.len() && list[i].name() == Some("s_endpgm") => {}
+            Flow::Branch(target) if list[i].name() == Some("s_cbranch_execz") => {
+                let Ok(end) = list.binary_search_by_key(&target, |inst| inst.offset) else {
+                    return none();
+                };
+                if end <= i + 1 || !restore(&list[end])
+                    || !list[i + 1..end].iter().any(|inst| inst.name() == Some("ds_bpermute_b32"))
+                    || !(i + 1..end).all(|n| flows[n] == Flow::Next &&
+                        match list[n].name() {
+                            Some("ds_bpermute_b32") => matches!(list[n].fields(true), Fields::Ds { gds: false, .. }),
+                            Some("s_waitcnt" | "s_nop") => true,
+                            _ => false,
+                        })
+                {
+                    return none();
+                }
+                elided[i] = true;
+            }
+            _ => return none(),
+        }
+    }
+    elided
 }
 
 /// Placeholder before renaming.
@@ -1085,6 +1141,29 @@ mod tests {
 
     fn input(p: &Program, reg: Reg) -> Value {
         p.inputs.iter().find(|i| i.0 == reg).expect("input").1
+    }
+
+    #[test]
+    fn wave64_execz_exchange_skip_elides_only_register_only_bodies() {
+        let words = [
+            0x7DA8_00A8, // v_cmpx_gt_u32 exec, 40, v0
+            0xBF88_0003, // s_cbranch_execz -> restore
+            0xDACC_0004, 0x0300_0002,
+            0xBF8C_C07F,
+            0xBEFE_04C1, // restore EXEC
+            S_ENDPGM,
+        ];
+        let p = build_words(&words, true);
+        assert_eq!(p.blocks.len(), 1);
+        assert!(p.blocks[0].insts.iter().any(|i| i.name() == "ds_bpermute_b32"));
+        assert!(!p.blocks[0].insts.iter().any(|i| i.name() == "s_cbranch_execz"));
+        assert!(build_words(&words, false).blocks.len() > 1);
+        let mut scalar = words;
+        scalar[4] = 0xBE94_0381; // an EXEC-independent scalar write
+        assert!(build_words(&scalar, true).blocks.len() > 1);
+        let mut no_restore = words;
+        no_restore[5] = 0xBE94_0381;
+        assert!(build_words(&no_restore, true).blocks.len() > 1);
     }
 
     #[test]
