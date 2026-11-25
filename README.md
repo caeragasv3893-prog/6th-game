@@ -959,7 +959,16 @@ and WARP 0.250/0.358 ms. These are end-to-end dispatch/readback times,
 including fresh queue, resource and fence creation on every sample.
 Revision `0792d40` adds 0, 1, 8, 32 and 64 exchange workloads and a
 zero-exchange control delta to help distinguish fixed costs from
-exchange scaling; the expanded benchmark has not yet been run.
+exchange scaling. The expanded Windows benchmark passed at `158681b`:
+hardware median at 0/1/8/32/64 exchanges was
+26.566/28.085/27.509/28.341/28.111 ms; WARP was
+0.273/0.204/0.263/0.407/0.354 ms. The hardware control already
+incurs most of the measured latency; these data do not establish
+GPU execution cost or gameplay performance. Revision `2b37360`
+adds optional D3D12 timestamp queries immediately before and after
+Dispatch and reports GPU-clock median/p95 alongside end-to-end timing.
+The timestamp path awaits Windows compilation and execution.
+Ordinary untimed correctness dispatches do not allocate queries.
 Arbitrary divergent control flow and partial-wave floating-point
 recognition remain open; no title data or AMD validation is claimed.
 
