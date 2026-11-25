@@ -915,6 +915,40 @@ Windows compilation, strict Clippy and hardware/WARP execution are
 pending. Arbitrary divergent branches and loops, partial-wave
 reductions and performance measurements are not yet covered.
 
+### Batched partial-wave and EXEC coverage (2026-11-25)
+
+In addition to the constant-EXEC bpermute work, the portable single-block
+subset now admits integer compare-derived EXEC predicates for bpermute.
+Inactive threads publish zero and still synchronize; their register
+destinations are preserved. This does not admit divergent branches,
+loops, arbitrary scalar mask sources or nonuniform barrier reachability.
+
+Uniform ballots now support incomplete logical waves. A one-thread tail
+never addresses a missing high accumulator, and nonexistent lanes
+contribute no bits. Recognized integer reductions and inclusive/exclusive
+integer sum prefixes may also use partial groups; only existing lanes
+contribute. Ordered floating-point graphs, DPP, swizzle and readlane
+still require complete groups where applicable.
+
+The new tests cover partial exchanges with three EXEC modes, partial
+ballots, eight integer reductions and both integer scan variants at
+multiple boundary widths. An opt-in release benchmark reports median
+and p95 end-to-end dispatch/readback latency for 64 consecutive portable
+exchanges, not GPU-only timestamps or gameplay FPS.
+
+Run the complete fail-fast Windows validation in one command:
+
+```powershell
+.\scripts\verify-wave64.ps1 -Benchmark
+```
+
+The script checks strict all-features Clippy, the targeted wave64 suite,
+the complete workspace tests, and the release build, then optionally
+runs the benchmark. All new changes since the validated revision
+`98cce6e` require runtime confirmation. Arbitrary divergent control
+flow and partial-wave floating-point recognition remain open; the
+branch is not yet validated with real title data or AMD hardware.
+
 ### Development roadmap
 
 - [x] Build the project on the NVIDIA test machine.
