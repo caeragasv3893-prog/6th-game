@@ -423,14 +423,14 @@ fn integer_reduction_op(op: super::wave::Op) -> Option<super::bitcode::Rmw> {
     })
 }
 
-/// Admit only a single, fully uniform recognized section, with pure
-/// integer instructions inside and ordinary lane-local setup/stores outside.
-/// All live section results must be recognized integer full-wave reductions.
+/// Admit only one recognized section in straight-line uniform code.
+/// Constant EXEC changes inside the symbolically simulated section are
+/// allowed, but the surrounding code must reach it with the full group.
+/// All escaping section results must be recognized integer reductions or
+/// integer sum prefixes of values defined before the section.
 fn portable_reduction_section(x: &Parts<'_>) -> bool {
-    use super::wave::Shape;
-    if x.p.blocks.len() != 1
-        || !x.st.guards.iter().flatten().all(|g| g.is_none() || *g == Some(Bool::TRUE))
-    {
+    use super::wave::{Op, Shape};
+    if x.p.blocks.len() != 1 {
         return false;
     }
     let block = &x.p.blocks[0];
@@ -447,8 +447,20 @@ fn portable_reduction_section(x: &Parts<'_>) -> bool {
     {
         return false;
     }
+    let Fields::Sop { dst: Some(Operand::Scalar { code, .. }), .. } = &block.insts[start].fields else {
+        return false;
+    };
+    let Some(saved) = block.insts[start].write(Reg::S(*code)) else {
+        return false;
+    };
     let inside = &block.insts[start + 1..sec.end];
     if !inside.iter().all(|i| {
+        if let Fields::Sop { dst: Some(Operand::Scalar { code, .. }), src, .. } = &i.fields {
+            let exec_write = (*code == EXEC && i.name() == "s_mov_b64")
+                || ((*code == EXEC || *code == EXEC + 1) && i.name() == "s_mov_b32");
+            return exec_write
+                && matches!(src.first(), Some(Operand::Const(128..=208) | Operand::Literal(_)));
+        }
         matches!(&i.fields, Fields::Valu(_))
             && matches!(i.name(), "v_cndmask_b32" | "v_mov_b32" | "v_readlane_b32"
                 | "v_permlanex16_b32" | "v_add_nc_u32" | "v_min_u32" | "v_max_u32"
@@ -463,7 +475,9 @@ fn portable_reduction_section(x: &Parts<'_>) -> bool {
         if n >= start && n <= sec.end {
             continue;
         }
-        if reads_mask_as_data(x.st, i) {
+        if x.st.guards[0][n].is_some_and(|g| g != Bool::TRUE)
+            || reads_mask_as_data(x.st, i)
+        {
             return false;
         }
         let ordinary = match i.name() {
@@ -480,8 +494,13 @@ fn portable_reduction_section(x: &Parts<'_>) -> bool {
         for &(_, v) in &i.reads {
             if defined.contains(&v) {
                 match sec.shapes.get(&v) {
-                    Some(Shape::Active(op, src, _, _))
-                        if integer_reduction_op(*op).is_some() && !defined.contains(src) => {
+                    Some(Shape::Active(op, src, mask, _))
+                        if integer_reduction_op(*op).is_some() && *mask == saved
+                            && !defined.contains(src) => {
+                        live = true;
+                    }
+                    Some(Shape::Prefix(Op::AddU, src, mask, 0, _))
+                        if *mask == saved && !defined.contains(src) => {
                         live = true;
                     }
                     _ => return false,
@@ -633,7 +652,7 @@ impl<'a> Lower<'a> {
             portable_lanes = x.native.wave64
                 && (!scratch || (64..=1024).contains(&threads)
                     && threads.is_multiple_of(64)
-                    && x.st.guards.iter().flatten().all(|g| g.is_none() || *g == Some(Bool::TRUE)))
+                    && (reduction || x.st.guards.iter().flatten().all(|g| g.is_none() || *g == Some(Bool::TRUE))))
                 && console_lanes
                 && s.lds_dwords == 0
                 && p.blocks.len() == 1
@@ -1313,7 +1332,13 @@ impl<'a> Lower<'a> {
         let x = self.i32_of(src)?;
         let id = self.s.m.i32(ident);
         let x = self.s.m.select(c, on, x, id);
-        if self.portable_lanes && prefix.is_none() {
+        if self.portable_lanes {
+            if let Some(inclusive) = prefix {
+                if op != Op::AddU || ident != 0 {
+                    return Err("a portable prefix other than an integer sum");
+                }
+                return Ok(self.portable_prefix_sum(x, inclusive));
+            }
             let rmw = integer_reduction_op(op).ok_or("a portable non-integer reduction")?;
             return Ok(self.portable_reduce(x, id, rmw));
         }
@@ -1983,6 +2008,35 @@ impl<'a> Lower<'a> {
         // A later ballot or bpermute must not overwrite a pending read.
         self.s.op(c, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[mode]);
         (lo, hi)
+    }
+
+    /// Uniform inclusive/exclusive scan of a logical wave. Each round
+    /// reads the previous round's value from a lower-numbered lane.
+    /// Two group barriers separate publication, reading and scratch reuse.
+    fn portable_prefix_sum(&mut self, value: V, inclusive: bool) -> V {
+        let c = self.cur;
+        let flat = self.mesh_thread();
+        let mask = self.s.m.i32(63);
+        let lane = self.s.m.bin(c, Bin::And, flat, mask);
+        let lds = self.s.lds();
+        let own = self.s.m.element(c, lds, flat);
+        let mode = self.s.m.i32(1 | 8);
+        let zero = self.s.m.i32(0);
+        let mut sum = value;
+        for d in [1, 2, 4, 8, 16, 32] {
+            let distance = self.s.m.i32(d);
+            let valid = self.s.m.cmp(c, pred::IUGE, lane, distance);
+            let prior = self.s.m.bin(c, Bin::Sub, flat, distance);
+            let index = self.s.m.select(c, valid, prior, flat);
+            let src = self.s.m.element(c, lds, index);
+            self.s.m.store(c, own, sum);
+            self.s.op(c, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[mode]);
+            let x = self.s.m.load(c, src);
+            self.s.op(c, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[mode]);
+            let x = self.s.m.select(c, valid, x, zero);
+            sum = self.s.m.bin(c, Bin::Add, sum, x);
+        }
+        if inclusive { sum } else { self.s.m.bin(c, Bin::Sub, sum, value) }
     }
 
     /// All logical-wave lanes contribute to one accumulator. Initialize
