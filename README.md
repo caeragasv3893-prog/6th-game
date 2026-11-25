@@ -398,6 +398,55 @@ reuse. This path requires straight-line code, no title LDS allocation,
 no nontrivial guards, complete 64-lane logical waves and at most 1024
 threads. Other cases retain their existing fixed-width lowering.
 
+#### How the cross-warp exchange works
+
+```mermaid
+flowchart TD
+    subgraph W["One logical wave64"]
+        direction LR
+        A["Warp 0<br/>Logical lanes 0–31"]
+        B["Warp 1<br/>Logical lanes 32–63"]
+    end
+    A --> C["Write each thread's value to its own scratch slot"]
+    B --> C
+    C --> D["Barrier 1<br/>All group writes are visible"]
+    D --> E["Shared GPU memory<br/>64 scratch dwords per logical wave"]
+    E --> F["Warp 0 reads the requested logical lane"]
+    E --> G["Warp 1 reads the requested logical lane"]
+    F --> H["Barrier 2<br/>All group reads complete"]
+    G --> H
+    H --> I["Scratch can safely be reused"]
+```
+
+A console wave64 contains 64 logical lanes, but the tested NVIDIA device
+reports a physical wave width of 32. Two physical warps can therefore
+participate in the same logical wave. The translator uses the flattened
+thread ID to compute the logical lane and its wave's scratch base:
+
+- Logical lane: `thread_id & 63`.
+- Scratch base: `thread_id & !63`.
+- Requested lane: `((address + offset) >> 2) & 63`.
+- Source scratch index: `base | requested_lane`.
+
+For example, in a uniform exchange with an address of four times the
+thread ID and an offset of 128 bytes, logical lane 0 reads lane 32,
+lane 31 reads lane 63, and lane 32 reads lane 0. A second logical wave
+uses a separate scratch region, so it cannot accidentally read the
+first wave's data.
+
+The first barrier ensures every thread has published its value before
+any other thread reads it. The second prevents a subsequent exchange
+from overwriting scratch while another thread is still reading the
+previous exchange. These are **thread-group-wide** barriers, not
+independent warp barriers. For a 128-thread group, scratch consumes
+512 bytes and holds two distinct logical waves.
+
+This diagram describes the implemented translation, not a performance
+measurement or a guarantee that arbitrary physical warp scheduling
+matches logical lane numbering. The mapping is based on thread IDs,
+not on assuming a particular hardware warp assignment. Only the
+conservative uniform subset described above is currently eligible.
+
 A new synthetic regression checks two successive exchanges across the
 32-lane boundary, two independent logical waves, three dispatches on
 each available adapter and the fixed-width fallback for a 96-thread
