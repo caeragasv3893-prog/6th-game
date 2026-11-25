@@ -372,8 +372,12 @@ and required wave-size checks.
 The new synthetic regression uses 128 threads and expects two sequences
 of lane numbers 0 through 63. It checks unrestricted PSV wave bounds and
 dispatch output on available hardware/WARP devices. The reference
-arithmetic was independently checked for all 128 threads; Rust compilation
-and dispatch validation are pending.
+arithmetic was independently checked for all 128 threads. The first
+Windows test exposed an unnecessary WaveOps DXIL flag; commit
+`a276ce1` removed it from portable MBCNT lowering. The targeted test
+then passed in 0.23 s, including DXIL validation and dispatch on at
+least one available SM 6.6 device. Strict all-features Clippy passed
+in 2.62 s. Full workspace and release validation remain pending.
 
 This does not implement cross-wave ballots, reductions, lane exchange,
 LDS synchronization, or arbitrary EXEC-mask emulation. Coverage of real
