@@ -98,10 +98,11 @@ standard features in 6.49 s and all features in 6.77 s.
 | Descriptor allocation and companion reuse | Share each reserved pair between two raw SRVs; retain stable indices across rewrites | Stress and companion tests passed on Windows |
 | Invalid raw buffer accesses | Check resource kind, write permission, alignment, size and overflow; use null views on invalid ranges | Boundary tests passed on Windows |
 | Shader descriptor metadata | Explicitly initialize stride/mark/address tables; clamp address indices and include full properties in handle cache key | 248 shader tests passed; 3 ignored |
-| Synthetic benchmarks | Descriptor allocation/release benchmark (100,000 cycles) | Not measured yet |
+| Synthetic benchmarks | Descriptor allocation/release benchmark (100,000 cycles) | PASS: 2.879 ms total, 28.79 ns per cycle (CPU allocator only) |
 | Continuous integration | Windows branch push checks, both Clippy configurations, workspace tests and release build | Both local strict Clippy configurations passed; hosted CI result not confirmed |
 | Full title-to-host descriptor remapping | Not implemented | Pending design and workloads |
-| VRAM profiling, additional shader coverage and performance | Not implemented | Pending measured baseline |
+| VRAM profiling | DXGI local/non-local process usage, budget, headroom and over-budget telemetry, logged at device creation and with frame statistics | New code; Windows validation pending |
+| Additional shader coverage and rendering performance | Not implemented | Pending measured baseline |
 
 The fixed portable ABI is still 1,000,000 resource descriptors; it does not
 expose all descriptors from a larger title heap. Oversized heaps are capped
@@ -109,6 +110,16 @@ with a warning, not fully remapped. Unaligned raw companion offsets use a
 null view rather than risk invalid D3D12 descriptors; preserving those
 reads requires an aligned copy or explicit shader offset handling. Companion
 slots remain reserved for the lifetime of the heap to avoid premature reuse.
+
+The release-mode descriptor benchmark passed on the NVIDIA test machine at
+revision `f76c2b9`. Its workload is 100,000 sequential allocations and
+releases of 16 contiguous slots. It does not measure GPU execution, contention,
+fragmentation under real workloads or game FPS.
+
+VRAM telemetry selects the DXGI adapter by the D3D12 device's LUID and queries
+node zero in both memory segments. The budget is dynamic and is not the same
+as total installed VRAM. Logging does not change resource residency or impose
+a memory limit. See [DXGI QueryVideoMemoryInfo](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_4/nf-dxgi1_4-idxgiadapter3-queryvideomemoryinfo).
 
 Run the new checks and benchmark without game data:
 
@@ -118,6 +129,7 @@ cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --locked -- --test-threads=1
 cargo build --release -p victory --locked
 cargo test -p victory-gpu --release --locked benchmark_dynamic_descriptor_churn -- --ignored --nocapture
+cargo test -p victory-gpu --lib --locked video_memory_budget_reports_segments -- --nocapture
 ```
 
 ### Development roadmap
