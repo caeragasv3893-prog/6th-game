@@ -39,6 +39,9 @@ pub(crate) struct HostHeap {
     /// taken, those given back, and where they end.
     pairs: Mutex<(u32, Vec<u32>)>,
     pairs_end: u32,
+    // Raw SRV companions reserved for structured title slots. Keep the
+    // same companion index for each slot until the heap is destroyed.
+    raw_aliases: Mutex<std::collections::HashMap<u32, u32>>,
     /// View heaps: the view-stride table translated shaders read
     /// (`victory_shader::emit::VIEW_STRIDES`), a dword per title slot: the
     /// byte stride of the buffer view there, 0 for none. Mapped at the
@@ -200,6 +203,7 @@ impl HostHeap {
                 null if !sampler && null > count + extra && null < total => null - 1,
                 _ => total,
             },
+            raw_aliases: Mutex::new(std::collections::HashMap::new()),
             strides,
             marks,
             addresses: std::sync::OnceLock::new(),
@@ -386,7 +390,7 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
-        let (kept, mark) = make_marked(view, self.cpu(index));
+        let (kept, mark, _) = make_marked(view, self.cpu(index));
         if kept.is_none() {
             null_for(view, self.cpu(index));
         }
@@ -461,9 +465,44 @@ impl HostHeap {
         }
         self.keep(index, None);
         self.set_stride(index, None);
+        self.clear_raw_srv_alias(index);
         self.set_mark(index, None);
         if index < self.count {
             self.viewed.set(index, None, false);
+        }
+    }
+
+    /// Create a raw companion for byte-addressed SRV reads, retaining the
+    /// structured original for shaders that use it as structured.
+    fn raw_srv_alias(&self, index: u32, buffer: &ID3D12Resource, first: u64, bytes: u64) -> u32 {
+        let null = victory_shader::emit::NULL_BUFFER_VIEW;
+        if !first.is_multiple_of(4) || bytes == 0 || !bytes.is_multiple_of(4) {
+            self.clear_raw_srv_alias(index);
+            return null;
+        }
+        let mut aliases = self.raw_aliases.lock().unwrap_or_else(|e| e.into_inner());
+        let alias = if let Some(&alias) = aliases.get(&index) {
+            alias
+        } else {
+            let Some(alias) = self.pair() else {
+                tracing::warn!(index, "no descriptor slots for raw SRV companion");
+                return null;
+            };
+            if alias >= null - 1 {
+                self.free_pair(alias);
+                return null;
+            }
+            aliases.insert(index, alias);
+            alias
+        };
+        self.raw_view_at(alias, Some(buffer), first, bytes, false);
+        alias
+    }
+
+    fn clear_raw_srv_alias(&self, index: u32) {
+        let aliases = self.raw_aliases.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(&alias) = aliases.get(&index) {
+            self.raw_view_at(alias, None, 0, 0, false);
         }
     }
 
@@ -663,7 +702,6 @@ impl HostHeap {
             return None;
         };
         if made[index as usize] != key {
-            self.set_stride(index, Some(&view));
             self.note_address(index, Some(&view));
             // Shaders index the heap itself (`crate::bindless`): buffer views
             // are made when written.
@@ -673,11 +711,23 @@ impl HostHeap {
             // ran the host out of memory (run b2).
             let later = !for_draw && is_placed_texture(&view);
             made[index as usize] = if later { 0 } else { key };
-            let (kept, mark) = if later {
-                (None, None)
+            let (kept, mark, raw) = if later {
+                (None, None, None)
             } else {
                 make_marked(&view, self.cpu(index))
             };
+            let stride = view_stride(&view);
+            let packed = match (raw, kept.as_ref().and_then(|k| k.as_ref())) {
+                (Some((first, bytes)), Some((buffer, _))) => {
+                    let alias = self.raw_srv_alias(index, buffer, first, bytes);
+                    stride | ((alias + 1) << 12)
+                }
+                _ => {
+                    self.clear_raw_srv_alias(index);
+                    stride
+                }
+            };
+            self.write_stride(index, packed);
             self.set_mark(index, mark);
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
@@ -914,6 +964,11 @@ fn buffer_srv(
         once!(first, count, element, "buffer view empty or past its host copy");
         return None;
     }
+    // Save the precise byte range of this structured SRV on its host copy
+    // for the raw companion. Do not change the original descriptor.
+    if buffer.StructureByteStride != 0 {
+        RAW_SRV.with(|r| r.set(Some((first * element, u64::from(count) * element))));
+    }
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
@@ -988,15 +1043,19 @@ thread_local! {
     /// The view-mark entry of the unordered buffer view [`make`] last made
     /// on this thread ([`make_marked`]).
     static MARK: std::cell::Cell<Option<(u32, u32)>> = const { std::cell::Cell::new(None) };
+    static RAW_SRV: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
 }
 
 /// [`make`], and the view-mark entry of the view if it is an unordered
 /// buffer view whose writes shaders mark (`victory_shader::emit`, "Write
 /// marks").
-fn make_marked(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> (Option<Kept>, Option<(u32, u32)>) {
+type MadeView = (Option<Kept>, Option<(u32, u32)>, Option<(u64, u64)>);
+
+fn make_marked(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> MadeView {
     MARK.with(|m| m.set(None));
+    RAW_SRV.with(|r| r.set(None));
     let kept = make(view, at);
-    (kept, MARK.with(std::cell::Cell::take))
+    (kept, MARK.with(std::cell::Cell::take), RAW_SRV.with(std::cell::Cell::take))
 }
 
 /// Whether the host can make a shader (or unordered access) view of
