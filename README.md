@@ -944,10 +944,17 @@ Run the complete fail-fast Windows validation in one command:
 
 The script checks strict all-features Clippy, the targeted wave64 suite,
 the complete workspace tests, and the release build, then optionally
-runs the benchmark. All new changes since the validated revision
-`98cce6e` require runtime confirmation. Arbitrary divergent control
-flow and partial-wave floating-point recognition remain open; the
-branch is not yet validated with real title data or AMD hardware.
+runs the benchmark. Windows validation at `31a8a77` passed strict
+Clippy (3.31 s) and 20 targeted wave64 tests, including the new partial
+ballots and integer reductions/prefixes on hardware and WARP. The
+masked exchange regression failed on hardware (63 threads, constant
+EXEC, second exchange, lane 1: expected 33, received 0). Review found
+that constant masks used the physical host lane index. Revision
+`91c9955` switches that mask lookup to the logical lane index in the
+portable path. This fix awaits hardware/WARP validation; the fail-fast
+script stopped before workspace tests, release build and benchmark.
+Arbitrary divergent control flow and partial-wave floating-point
+recognition remain open; no title data or AMD validation is claimed.
 
 ### Development roadmap
 
