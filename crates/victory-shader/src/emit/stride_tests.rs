@@ -749,6 +749,111 @@ fn wave64_ballot_reconstructs_both_mask_words_and_count() {
 }
 
 #[test]
+fn wave64_integer_butterfly_reductions_cross_warps() {
+    // Each operation explicitly combines the value with its partner at
+    // lane XOR 1, 2, 4, 8, 16 and 32. The final step crosses warps.
+    // Start with alternating signed-negative and positive values to
+    // distinguish signed extrema, unsigned extrema and wrapping addition.
+    let ops = [0x25u32, 0x13, 0x14, 0x11, 0x12, 0x1b, 0x1c, 0x1d];
+    let vop2 = |op: u32, dst: u32, src0: u32, src1: u32| {
+        (op << 25) | (dst << 17) | (src1 << 9) | src0
+    };
+    let mut words = vec![
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202, 0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    ];
+    for (slot, &op) in ops.iter().enumerate() {
+        words.extend([
+            0x3402_009F, // v_lshlrev_b32 v1, 31, v0
+            vop2(0x1c, 1, 256, 1), // v_or_b32 v1, v0, v1
+        ]);
+        for distance in [1u32, 2, 4, 8, 16, 32] {
+            let bytes = distance * 4;
+            // v_xor_b32 v3, byte distance, v2.
+            if bytes <= 64 {
+                words.push(vop2(0x1d, 3, 128 + bytes, 2));
+            } else {
+                words.extend([vop2(0x1d, 3, 255, 2), bytes]);
+            }
+            words.extend([
+                0xDACC_0000, 0x0400_0103, // ds_bpermute_b32 v4, v3, v1
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                vop2(op, 1, 260, 1), // combine v4 and v1
+            ]);
+        }
+        words.extend([
+            0xE070_1000 | (slot as u32 * 512),
+            0x8002_0102, // buffer_store_dword v1, v2, s[8:11], 0 offen
+        ]);
+    }
+    words.push(0xBF81_0000);
+    let shader = build_wave(
+        &words,
+        vec![param(RootType::Table, 0)],
+        vec![entry(ResourceType::Uav, 4, 0)],
+        128,
+        true,
+    );
+    let c = crate::Container::parse(&shader.dxil).unwrap();
+    let psv = c.part(crate::FourCC::PSV0).unwrap().data;
+    assert_eq!(u32::from_le_bytes(psv[20..24].try_into().unwrap()), 0);
+    assert_eq!(u32::from_le_bytes(psv[24..28].try_into().unwrap()), u32::MAX);
+    let combine = |op, a: u32, b: u32| match op {
+        0x25 => a.wrapping_add(b),
+        0x13 => a.min(b),
+        0x14 => a.max(b),
+        0x11 => (a as i32).min(b as i32) as u32,
+        0x12 => (a as i32).max(b as i32) as u32,
+        0x1b => a & b,
+        0x1c => a | b,
+        0x1d => a ^ b,
+        _ => unreachable!(),
+    };
+    let mut want = Vec::new();
+    for op in ops {
+        for base in [0u32, 64] {
+            let result = (base..base + 64)
+                .map(|i| (i << 31) | i)
+                .reduce(|a, b| combine(op, a, b))
+                .unwrap();
+            want.extend([result; 64]);
+        }
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host.compute_pipeline(&shader).unwrap_or_else(
+            |e| panic!("{label}: compute pipeline failed: {e}"),
+        );
+        for _ in 0..3 {
+            let out = host.dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(vec![0; shader.user_data_dwords().max(1) as usize]))],
+                    views: &[View::RawUav(1024)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            ).unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            assert_eq!(out[0], want, "{label}");
+        }
+        eprintln!("{label}: eight integer reductions across two logical waves passed");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+#[test]
 fn a_half_buffer_load_by_index_reads_the_structured_element() {
     let mut code = HALF_LOAD_WAVE32.to_vec();
     // buffer_load_ushort v2, v0, s[8:11], 0 idxen offset:6.
