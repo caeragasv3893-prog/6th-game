@@ -771,6 +771,38 @@ cargo test -p victory-shader --lib --locked wave64_ -- --test-threads=1 --nocapt
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 ```
 
+### Ordered recognized FP32 wave64 sums (2026-11-25)
+
+The previous symbolic analysis identified the contributing lanes, but
+discarded their addition tree. A separate bounded replay now retains
+the ordered binary addition graph for a narrow subset of full-EXEC
+sections containing masked inputs, DPP moves/adds and readlane.
+The normal recognizer must identify a full-wave FP32 sum, and the
+ordered replay must agree on one result graph across all 64 lanes.
+Unsupported instructions, unknown operands, differing graphs and
+sections longer than 128 instructions are excluded from this path.
+
+The portable lowering publishes one input per lane to shared memory,
+synchronizes, reads the needed logical-lane inputs, synchronizes before
+scratch reuse, and evaluates the reachable addition graph in its
+original association. No floating-point atomic addition or arbitrary
+reassociation is used. This is a correctness-first path: a full sum
+can require 64 explicit loads and 63 FP32 additions per thread.
+
+The new regression checks rounding-sensitive row sums, signed zeros,
+infinities and NaN classification on two logical waves. One input has
+row totals 16777216, 1, 1 and -16777216: the original row-combination
+order yields 0, while regrouping yields 1. Independent FP32 arithmetic
+confirmed both results. Compilation, DXIL validation and GPU execution
+of the new regression are pending. This does not establish bit-exact
+behavior for arbitrary FP modes, NaN payloads or general divergent
+sections. FP16, floating-point prefix scans and performance remain open.
+
+```powershell
+cargo test -p victory-shader --lib --locked wave64_ -- --test-threads=1 --nocapture
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+```
+
 ### Development roadmap
 
 - [x] Build the project on the NVIDIA test machine.
