@@ -867,6 +867,34 @@ GPU validation are pending. Unsupported DPP controls, general divergent
 EXEC, automatic whole-wave FP16 and performance optimization remain
 open.
 
+### Ordered FP16 reductions, additional lane reads and prefix selection (2026-11-25)
+
+The portable recognizer now accepts the narrow whole-wave FP16 sum
+subset when the symbolic analysis identifies the source of the high
+half and an independent replay reconstructs the original low-half
+addition graph. Each addition is narrowed with the existing FP16
+rounding helper before its result participates in another addition.
+The untouched high half comes from the logical lane identified by
+the original sequence. This replaces the single-rounding shortcut
+for this eligible portable subset only. Other FP16 patterns retain
+their previous requirements.
+
+The straight-line uniform compute path also admits ds_swizzle_b32
+and v_readlane_b32 with a proven literal lane below 64. Both use the
+same private scratch and uniform barriers as bpermute and DPP.
+Ordered prefix result selection is now a balanced six-level tree
+rather than a chain of 63 selects, without changing the arithmetic
+graph. This reduces selection dependency depth, not necessarily
+measured GPU execution time.
+
+New synthetic regressions cover the recognized FP16 sum, including
+intermediate rounding and high-half preservation, and the additional
+lane reads over two logical waves. These changes and the previous
+DPP revision still require Windows compilation, strict Clippy, DXIL
+and hardware/WARP validation. General divergent control flow,
+unrecognized FP16 operations, partial groups and measured performance
+remain open. No AMD or title gameplay validation is claimed.
+
 ### Development roadmap
 
 - [x] Build the project on the NVIDIA test machine.
