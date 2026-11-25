@@ -582,7 +582,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
 /// inputs; later nodes are binary adds in original operand order.
 pub(crate) struct OrderedSum {
     pub adds: Vec<(usize, usize)>,
-    pub root: usize,
+    pub roots: [usize; 64],
 }
 
 /// Independently replay the narrow full-EXEC sum subset without discarding
@@ -595,6 +595,28 @@ pub(crate) fn ordered_sum(
     saved: Value,
     identity: u32,
 ) -> Option<OrderedSum> {
+    ordered_graph(insts, result, source, saved, identity, false)
+}
+
+/// Preserve the actual addition graph for each lane of an inclusive prefix.
+pub(crate) fn ordered_prefix(
+    insts: &[Inst],
+    result: Value,
+    source: Value,
+    saved: Value,
+    identity: u32,
+) -> Option<OrderedSum> {
+    ordered_graph(insts, result, source, saved, identity, true)
+}
+
+fn ordered_graph(
+    insts: &[Inst],
+    result: Value,
+    source: Value,
+    saved: Value,
+    identity: u32,
+    prefix: bool,
+) -> Option<OrderedSum> {
     if insts.len() > 128 {
         return None;
     }
@@ -602,12 +624,32 @@ pub(crate) fn ordered_sum(
     let mut values: HashMap<Value, Lanes> = HashMap::new();
     let mut adds = Vec::new();
     let mut intern = HashMap::new();
+    let mut exec = u64::MAX;
     let imm = |op: &Operand| match *op {
         Operand::Const(c) => crate::resource::inline(c),
         Operand::Literal(x) => Some(x),
         _ => None,
     };
     for inst in insts {
+        if inst.write(Reg::S(EXEC)).is_some() {
+            if !prefix || !matches!(inst.name(), "s_mov_b32" | "s_mov_b64") {
+                return None;
+            }
+            let k = constant(inst)?;
+            exec = if inst.name() == "s_mov_b64" {
+                k
+            } else {
+                (exec & !0xFFFF_FFFF) | (k & 0xFFFF_FFFF)
+            };
+            continue;
+        }
+        if inst.write(Reg::S(EXEC + 1)).is_some() {
+            if !prefix || inst.name() != "s_mov_b32" {
+                return None;
+            }
+            exec = (exec & 0xFFFF_FFFF) | ((constant(inst)? & 0xFFFF_FFFF) << 32);
+            continue;
+        }
         let Fields::Valu(v) = &inst.fields else { return None };
         if v.abs != 0 || v.neg != 0 || v.clamp || v.omod != 0 || v.sdwa.is_some() {
             return None;
@@ -631,7 +673,7 @@ pub(crate) fn ordered_sum(
         let Operand::Vector { reg, .. } = v.dst? else { return None };
         let dst = inst.write(Reg::V(reg))?;
         let lanes = if inst.name() == "v_cndmask_b32" {
-            if v.dpp.is_some() || imm(v.src.first()?)? != identity {
+            if exec != u64::MAX || v.dpp.is_some() || imm(v.src.first()?)? != identity {
                 return None;
             }
             let Operand::Vector { reg, .. } = *v.src.get(1)? else { return None };
@@ -649,7 +691,14 @@ pub(crate) fn ordered_sum(
             };
             let old = inst.read(Reg::V(reg)).and_then(|x| values.get(&x).copied());
             let mut lanes = [None; 64];
+            if v.dpp.is_some() && exec != u64::MAX {
+                return None;
+            }
             for (lane, out) in lanes.iter_mut().enumerate() {
+                if exec >> lane & 1 == 0 {
+                    *out = old?[lane];
+                    continue;
+                }
                 let from = if let Some(dpp) = v.dpp {
                     let (from, zero, writes) = dpp_lane(dpp, lane as u32)?;
                     if !writes {
@@ -682,11 +731,27 @@ pub(crate) fn ordered_sum(
         values.insert(dst, lanes);
     }
     let lanes = values.get(&result)?;
-    let root = lanes[0]?;
-    if root < 64 || !lanes.iter().all(|&n| n == Some(root)) {
+    let mut roots = [0; 64];
+    for (root, lane) in roots.iter_mut().zip(lanes) {
+        *root = (*lane)?;
+    }
+    if prefix {
+        // Independently prove that each result includes exactly its prefix.
+        // Repeated inputs are not valid sum terms.
+        let mut masks: Vec<u64> = (0..64).map(|lane| 1u64 << lane).collect();
+        for &(a, b) in &adds {
+            let (a, b) = (masks[a], masks[b]);
+            masks.push(if a == 0 || b == 0 || a & b != 0 { 0 } else { a | b });
+        }
+        for (lane, &root) in roots.iter().enumerate() {
+            if masks[root] != u64::MAX >> (63 - lane) {
+                return None;
+            }
+        }
+    } else if roots[0] < 64 || !roots.iter().all(|&n| n == roots[0]) {
         return None;
     }
-    Some(OrderedSum { adds, root })
+    Some(OrderedSum { adds, roots })
 }
 
 fn constant(inst: &Inst) -> Option<u64> {
