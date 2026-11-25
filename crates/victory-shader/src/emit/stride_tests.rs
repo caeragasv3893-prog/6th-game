@@ -665,6 +665,66 @@ fn wave64_bpermute_exchanges_values_across_warps() {
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
 
+/// End-to-end dispatch/readback timing, not GPU-only timestamps.
+/// Keep it opt-in so correctness CI is not sensitive to host load.
+#[test]
+#[ignore = "benchmark: release dispatch/readback timing"]
+fn benchmark_wave64_portable_exchange() {
+    let mut words = vec![
+        0xBE84_0300, 0xBE85_0380,
+        0xF408_0202, 0xFA00_0000,
+        0x3404_0082, 0xBF8C_C07F,
+        0x7E06_0300, // v3 = v0
+    ];
+    for _ in 0..64 {
+        words.extend([0xDACC_0004, 0x0300_0302, 0xBF8C_C07F]);
+    }
+    words.extend([0xE070_1000, 0x8002_0302, 0xBF81_0000]);
+    let shader = build_wave(
+        &words,
+        vec![param(RootType::Table, 0)],
+        vec![entry(ResourceType::Uav, 4, 0)],
+        128,
+        true,
+    );
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host.compute_pipeline(&shader).unwrap_or_else(
+            |e| panic!("{label}: compute pipeline failed: {e}"),
+        );
+        let dispatch = Dispatch {
+            roots: vec![(0, Root::Constants(vec![0; shader.user_data_dwords().max(1) as usize]))],
+            views: &[View::RawUav(128)],
+            samplers: &[],
+            groups: [1, 1, 1],
+        };
+        let want: Vec<u32> = (0..128).collect();
+        for _ in 0..3 {
+            let out = host.dispatch(&root, &pso, &dispatch).unwrap();
+            assert_eq!(out[0], want);
+        }
+        let mut elapsed = Vec::new();
+        for _ in 0..20 {
+            let start = std::time::Instant::now();
+            let out = host.dispatch(&root, &pso, &dispatch).unwrap();
+            elapsed.push(start.elapsed());
+            assert_eq!(out[0], want);
+        }
+        elapsed.sort_unstable();
+        eprintln!("{label}: 64 exchanges, 128 threads, dispatch/readback median {:.3} ms, p95 {:.3} ms",
+            elapsed[10].as_secs_f64() * 1000.0,
+            elapsed[18].as_secs_f64() * 1000.0);
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
 #[test]
 fn wave64_bpermute_partial_groups_and_masked_sources() {
     let _one = super::valu_tests::ONE_AT_A_TIME
