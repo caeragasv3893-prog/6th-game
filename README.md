@@ -595,6 +595,47 @@ cargo test -p victory-shader --lib --locked wave64_ -- --test-threads=1 --nocapt
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 ```
 
+### Recognized uniform integer wave64 reductions (2026-11-25)
+
+The existing symbolic whole-wave section recognizer is now connected to
+a shared-memory integer reduction path for a deliberately narrow
+subset of compute shaders: one straight-line, uniformly executed
+section, no title LDS, complete logical waves, pure supported integer
+instructions within the section, and only recognized integer full-wave
+results escaping it. Other shaders retain the existing lowering.
+
+```mermaid
+flowchart TD
+    A["Native whole-wave instruction section"] --> B["Symbolic lane analysis"]
+    B --> C{"Eligible integer full-wave reduction?"}
+    C -->|Yes| D["Initialize one accumulator per logical wave"]
+    D --> E["Group barrier"]
+    E --> F["Atomic integer reduction"]
+    F --> G["Group barrier"]
+    G --> H["Read result and synchronize before reuse"]
+    C -->|No| I["Existing lowering and capability checks"]
+```
+
+The accumulator supports wrapping addition, signed/unsigned min/max,
+and bitwise AND/OR/XOR. The new synthetic integration test constructs
+four DPP row sums, reads their final lanes, and combines them. It checks
+the symbolic recognizer actually produces an integer sum, unrestricted
+DXIL wave bounds and the expected output for two independent 64-lane
+waves (2016 and 6112). The row-sum reference arithmetic was checked
+independently. Windows compilation, DXIL validation and dispatch are
+pending; the new automatic path has a sum integration test, not yet
+individual GPU tests for every accumulator operation.
+
+This does not yet support arbitrary whole-wave sections, prefixes,
+floating-point reductions or divergent EXEC. Atomic contention and
+three group barriers may incur overhead; no measured FPS improvement
+is claimed.
+
+```powershell
+cargo test -p victory-shader --lib --locked wave64_ -- --test-threads=1 --nocapture
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+```
+
 ### Development roadmap
 
 - [x] Build the project on the NVIDIA test machine.
