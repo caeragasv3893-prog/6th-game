@@ -309,6 +309,25 @@ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline>
     None
 }
 
+/// Exact wave size declared by a translated shader's PSV runtime info.
+/// The first word is the runtime info size; its min/max wave counts are
+/// at offsets 16 and 20. Unrestricted shaders have 0 and u32::MAX.
+fn psv_wave_size(psv: &[u8]) -> Option<u32> {
+    let size = u32::from_le_bytes(psv.get(..4)?.try_into().ok()?) as usize;
+    if size < 24 {
+        return None;
+    }
+    let info = psv.get(4..4usize.checked_add(size)?)?;
+    let min = u32::from_le_bytes(info.get(16..20)?.try_into().ok()?);
+    let max = u32::from_le_bytes(info.get(20..24)?.try_into().ok()?);
+    (min != 0 && min == max).then_some(min)
+}
+
+fn required_wave_size(dxil: &[u8]) -> Option<u32> {
+    let c = victory_shader::Container::parse(dxil).ok()?;
+    psv_wave_size(c.part(victory_shader::FourCC::PSV0)?.data)
+}
+
 impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
@@ -348,6 +367,17 @@ impl HostPipeline {
             s.translated()?;
         }
         let host = host()?;
+        for (s, _) in &stages {
+            let translated = s.translated()?;
+            if let Some(lanes) = required_wave_size(&translated.host.dxil)
+                && !host.may_support_wave(lanes)
+            {
+                return refuse(
+                    "the host GPU cannot supply a shader's required wave width",
+                    shaders,
+                );
+            }
+        }
         // `SFI0`: 64-bit atomics on typed resources and on heap resources.
         let atomics64 = stages.iter().any(|(s, _)| {
             let Some(t) = s.translated() else {
@@ -811,6 +841,24 @@ fn root_signature(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn psv_wave_size_detects_exact_requirements() {
+        let mut psv = [0u8; 52];
+        psv[..4].copy_from_slice(&48u32.to_le_bytes());
+        psv[24..28].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(psv_wave_size(&psv), None);
+        for lanes in [32u32, 64] {
+            psv[20..24].copy_from_slice(&lanes.to_le_bytes());
+            psv[24..28].copy_from_slice(&lanes.to_le_bytes());
+            assert_eq!(psv_wave_size(&psv), Some(lanes));
+        }
+        psv[20..24].copy_from_slice(&32u32.to_le_bytes());
+        assert_eq!(psv_wave_size(&psv), None);
+        assert_eq!(psv_wave_size(&psv[..27]), None);
+        psv[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(psv_wave_size(&psv), None);
+    }
 
     fn element(format: DXGI_FORMAT, offset: u32) -> D3D12_INPUT_ELEMENT_DESC {
         D3D12_INPUT_ELEMENT_DESC {
