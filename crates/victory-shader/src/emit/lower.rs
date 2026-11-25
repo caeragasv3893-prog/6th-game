@@ -4348,7 +4348,9 @@ impl<'a> Lower<'a> {
         let four = self.s.m.i32(4);
         let at = self.s.m.bin(c, Bin::Mul, index, four);
         let table = self.s.root_srv_handle(VIEW_STRIDES);
-        self.raw_dword(table, at)
+        let packed = self.raw_dword(table, at);
+        let mask = self.s.m.i32(0xFFF);
+        self.s.m.bin(c, Bin::And, packed, mask)
     }
 
     /// Title memory at a raw GPU address (decision 0005: the unified-memory
@@ -4786,21 +4788,10 @@ impl<'a> Lower<'a> {
             _ => self.lane_heap_index(src, false)?,
         };
         let c = self.cur;
-        let four = self.s.m.i32(4);
-        let at = self.s.m.bin(c, Bin::Mul, index, four);
-        let table = self.s.root_srv_handle(VIEW_STRIDES);
-        let iu = self.s.m.undef(self.s.t.i32);
-        let mask = self.s.m.i8(1);
-        let r = self.s.op(
-            c,
-            "rawBufferLoad.f32",
-            Attr::ReadOnly,
-            self.s.t.res_ret,
-            139,
-            &[table, at, iu, mask, four],
-        );
-        let x = self.s.m.extract(c, r, 0);
-        Ok(self.as_int(x))
+        let last = self.s.m.i32(super::HEAP_VIEWS - 1);
+        let over = self.s.m.cmp(c, pred::IUGT, index, last);
+        let index = self.s.m.select(c, over, last, index);
+        Ok(self.stride_at(index))
     }
 
     /// The used-resource entry a descriptor loaded from a table falls in.
@@ -5046,9 +5037,23 @@ impl<'a> Lower<'a> {
         let (iu, mask) = (self.s.m.undef(self.s.t.i32), self.s.m.i8(1));
         let r = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139, &[table, at, iu, mask, four]);
         let x = self.s.m.extract(c, r, 0);
-        let stride = self.as_int(x);
+        let packed = self.as_int(x);
+        let mask = self.s.m.i32(0xFFF);
+        let stride = self.s.m.bin(c, Bin::And, packed, mask);
         let zero = self.s.m.i32(0);
         let none = self.s.m.cmp(c, pred::EQ, stride, zero);
+        // A raw SRV access to a structured view uses its raw companion.
+        // High 20 bits encode its index plus one (zero: original slot).
+        let index = if props.0 & 0x10FF == 11 {
+            let shift = self.s.m.i32(12);
+            let alias = self.s.m.bin(c, Bin::LShr, packed, shift);
+            let has_alias = self.s.m.cmp(c, pred::NE, alias, zero);
+            let one = self.s.m.i32(1);
+            let alias = self.s.m.bin(c, Bin::Sub, alias, one);
+            self.s.m.select(c, has_alias, alias, index)
+        } else {
+            index
+        };
         // The null unordered access view sits just below the null SRV.
         let null = super::NULL_BUFFER_VIEW - u32::from(props.0 & 0x1000 != 0);
         let null = self.s.m.i32(null);
