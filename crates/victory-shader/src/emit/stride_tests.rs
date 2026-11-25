@@ -879,101 +879,101 @@ fn wave64_recognized_integer_reductions_use_shared_accumulators() {
         let signed_or_unsigned_extrema = matches!(op, Op::MinU | Op::MaxU | Op::MinI | Op::MaxI);
         let source = if signed_or_unsigned_extrema { 261 } else { 256 };
         let mut words = vec![
-        0xBE84_0300, // s_mov_b32 s4, s0
-        0xBE85_0380, // s_mov_b32 s5, 0
-        0xF408_0202, 0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
-        0x3404_0082, // v_lshlrev_b32 v2, 2, v0
-        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
-    ];
-    if signed_or_unsigned_extrema {
-        words.push(0x340A_009A); // v_lshlrev_b32 v5, 26, v0
-    }
-    words.push(0xBE98_25C1); // s_or_saveexec_b64 s[24:25], -1
-    let ident_operand = match identity {
-        0 => 128,
-        u32::MAX => 193,
-        _ => 255,
-    };
-    words.extend(vop3(1, 0x101, ident_operand, source, 24));
-    if ident_operand == 255 {
-        words.push(identity);
-    }
-    for shift in [1u32, 2, 4, 8] {
-        words.push(combine(1, 0xFA, 1));
-        words.push(0xFF00_0001 | ((0x110 + shift) << 8)); // row_shr DPP
-    }
-    for (reg, lane) in [(16, 15), (17, 31), (18, 47), (19, 63)] {
-        words.extend(vop3(reg, 0x360, 257, 128 + lane, 0)); // read each row sum
-    }
-    words.extend([
-        0x7E06_0210, // v_mov_b32 v3, s16
-        combine(3, 17, 3),
-        combine(3, 18, 3),
-        combine(3, 19, 3),
-        0xBEFE_0418, // s_mov_b64 exec, s[24:25]
-        0xE070_1000, 0x8002_0302, // buffer_store_dword v3, v2, s[8:11], 0 offen
-        0xBF81_0000,
-    ]);
-    // Verify the actual symbolic recognizer, not only the emitted output.
-    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-    let p = ir::build(&code, true, 8).unwrap();
-    let sections = super::wave::sections(&p, 0);
-    assert!(sections.values().any(|sec| sec.shapes.values().any(
-        |sh| matches!(sh, Shape::Active(found, _, _, ident) if *found == op && *ident == identity)
-    )), "{op:?}: the reduction must be recognized");
-    let shader = build_wave(
-        &words,
-        vec![param(RootType::Table, 0)],
-        vec![entry(ResourceType::Uav, 4, 0)],
-        128,
-        true,
-    );
-    let c = crate::Container::parse(&shader.dxil).unwrap();
-    let psv = c.part(crate::FourCC::PSV0).unwrap().data;
-    assert_eq!(u32::from_le_bytes(psv[20..24].try_into().unwrap()), 0);
-    assert_eq!(u32::from_le_bytes(psv[24..28].try_into().unwrap()), u32::MAX);
-    let reference = |a: u32, b: u32| match op {
-        Op::AddU => a.wrapping_add(b),
-        Op::MinU => a.min(b),
-        Op::MaxU => a.max(b),
-        Op::MinI => (a as i32).min(b as i32) as u32,
-        Op::MaxI => (a as i32).max(b as i32) as u32,
-        Op::And => a & b,
-        Op::Or => a | b,
-        Op::Xor => a ^ b,
-        _ => unreachable!(),
-    };
-    let mut want = Vec::new();
-    for base in [0u32, 64] {
-        let result = (base..base + 64)
-            .map(|i| if signed_or_unsigned_extrema { i << 26 } else { i })
-            .fold(identity, reference);
-        want.extend([result; 64]);
-    }
-    let mut ran = 0;
-    for (label, warp) in [("hardware", false), ("warp", true)] {
-        let Ok(host) = Host::new(warp) else {
-            eprintln!("no SM 6.6 {label} device; skipped");
-            continue;
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202, 0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        ];
+        if signed_or_unsigned_extrema {
+            words.push(0x340A_009A); // v_lshlrev_b32 v5, 26, v0
+        }
+        words.push(0xBE98_25C1); // s_or_saveexec_b64 s[24:25], -1
+        let ident_operand = match identity {
+            0 => 128,
+            u32::MAX => 193,
+            _ => 255,
         };
-        let (root, pso) = host.compute_pipeline(&shader).unwrap_or_else(
-            |e| panic!("{label}: compute pipeline failed: {e}"),
+        words.extend(vop3(1, 0x101, ident_operand, source, 24));
+        if ident_operand == 255 {
+            words.push(identity);
+        }
+        for shift in [1u32, 2, 4, 8] {
+            words.push(combine(1, 0xFA, 1));
+            words.push(0xFF00_0001 | ((0x110 + shift) << 8)); // row_shr DPP
+        }
+        for (reg, lane) in [(16, 15), (17, 31), (18, 47), (19, 63)] {
+            words.extend(vop3(reg, 0x360, 257, 128 + lane, 0)); // read each row sum
+        }
+        words.extend([
+            0x7E06_0210, // v_mov_b32 v3, s16
+            combine(3, 17, 3),
+            combine(3, 18, 3),
+            combine(3, 19, 3),
+            0xBEFE_0418, // s_mov_b64 exec, s[24:25]
+            0xE070_1000, 0x8002_0302, // buffer_store_dword v3, v2, s[8:11], 0 offen
+            0xBF81_0000,
+        ]);
+        // Verify the actual symbolic recognizer, not only the emitted output.
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = ir::build(&code, true, 8).unwrap();
+        let sections = super::wave::sections(&p, 0);
+        assert!(sections.values().any(|sec| sec.shapes.values().any(
+            |sh| matches!(sh, Shape::Active(found, _, _, ident) if *found == op && *ident == identity)
+        )), "{op:?}: the reduction must be recognized");
+        let shader = build_wave(
+            &words,
+            vec![param(RootType::Table, 0)],
+            vec![entry(ResourceType::Uav, 4, 0)],
+            128,
+            true,
         );
-        let out = host.dispatch(
-            &root,
-            &pso,
-            &Dispatch {
-                roots: vec![(0, Root::Constants(vec![0; shader.user_data_dwords().max(1) as usize]))],
-                views: &[View::RawUav(128)],
-                samplers: &[],
-                groups: [1, 1, 1],
-            },
-        ).unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
-        assert_eq!(out[0], want, "{label}: {op:?}");
-        eprintln!("{label}: recognized wave64 {op:?} passed");
-        ran += 1;
-    }
-    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+        let c = crate::Container::parse(&shader.dxil).unwrap();
+        let psv = c.part(crate::FourCC::PSV0).unwrap().data;
+        assert_eq!(u32::from_le_bytes(psv[20..24].try_into().unwrap()), 0);
+        assert_eq!(u32::from_le_bytes(psv[24..28].try_into().unwrap()), u32::MAX);
+        let reference = |a: u32, b: u32| match op {
+            Op::AddU => a.wrapping_add(b),
+            Op::MinU => a.min(b),
+            Op::MaxU => a.max(b),
+            Op::MinI => (a as i32).min(b as i32) as u32,
+            Op::MaxI => (a as i32).max(b as i32) as u32,
+            Op::And => a & b,
+            Op::Or => a | b,
+            Op::Xor => a ^ b,
+            _ => unreachable!(),
+        };
+        let mut want = Vec::new();
+        for base in [0u32, 64] {
+            let result = (base..base + 64)
+                .map(|i| if signed_or_unsigned_extrema { i << 26 } else { i })
+                .fold(identity, reference);
+            want.extend([result; 64]);
+        }
+        let mut ran = 0;
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                eprintln!("no SM 6.6 {label} device; skipped");
+                continue;
+            };
+            let (root, pso) = host.compute_pipeline(&shader).unwrap_or_else(
+                |e| panic!("{label}: compute pipeline failed: {e}"),
+            );
+            let out = host.dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(vec![0; shader.user_data_dwords().max(1) as usize]))],
+                    views: &[View::RawUav(128)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            ).unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            assert_eq!(out[0], want, "{label}: {op:?}");
+            eprintln!("{label}: recognized wave64 {op:?} passed");
+            ran += 1;
+        }
+        assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
     }
 }
 
