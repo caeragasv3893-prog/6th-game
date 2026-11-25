@@ -426,8 +426,8 @@ fn integer_reduction_op(op: super::wave::Op) -> Option<super::bitcode::Rmw> {
 /// Admit only one recognized section in straight-line uniform code.
 /// Constant EXEC changes inside the symbolically simulated section are
 /// allowed, but the surrounding code must reach it with the full group.
-/// All escaping section results must be recognized integer reductions or
-/// integer sum prefixes of values defined before the section.
+/// All escaping section results must be recognized integer reductions,
+/// integer sum prefixes or FP32 extrema of values defined before the section.
 fn portable_reduction_section(x: &Parts<'_>) -> bool {
     use super::wave::{Op, Shape};
     if x.p.blocks.len() != 1 {
@@ -454,7 +454,16 @@ fn portable_reduction_section(x: &Parts<'_>) -> bool {
         return false;
     };
     let inside = &block.insts[start + 1..sec.end];
+    let float_extrema = inside.iter().any(|i| matches!(i.name(), "v_min_f32" | "v_max_f32"));
     if !inside.iter().all(|i| {
+        // A constant moved into a register could otherwise look like a
+        // numeric identity in the symbolic analysis, even for NaNs.
+        if float_extrema && i.name() == "v_mov_b32"
+            && !matches!(&i.fields, Fields::Valu(v)
+                if v.src.iter().all(|o| matches!(o, Operand::Vector { .. } | Operand::Scalar { code: 0..=103, .. })))
+        {
+            return false;
+        }
         if let Fields::Sop { dst: Some(Operand::Scalar { code, .. }), src, .. } = &i.fields {
             let exec_write = (*code == EXEC && i.name() == "s_mov_b64")
                 || ((*code == EXEC || *code == EXEC + 1) && i.name() == "s_mov_b32");
