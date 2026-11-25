@@ -676,10 +676,10 @@ impl<'a> Lower<'a> {
             let wave = if x.native.wave64 { 64 } else { 32 };
             let one_wave = cs.threads.iter().product::<u32>() <= wave;
             // Scratch operations require no title LDS and a single block.
-            // Partial waves and per-instruction EXEC masks are admitted
-            // only for explicit bpermute, whose inactive sources read zero.
-            // Other cross-lane operations still require complete waves
-            // and full EXEC; every thread must reach the group barriers.
+            // Explicit bpermute admits per-instruction EXEC masks.
+            // Uniform ballots also admit partial waves. Other cross-lane
+            // operations retain complete-wave and full-EXEC restrictions;
+            // every thread must reach the group barriers.
             let reduction = x.native.wave64 && portable_reduction_section(x);
             let scratch = reduction || insts().any(|i| {
                 matches!(i.name(), "ds_bpermute_b32" | "ds_swizzle_b32" | "v_readlane_b32")
@@ -695,6 +695,9 @@ impl<'a> Lower<'a> {
                     && !matches!(i.name(), "ds_swizzle_b32" | "v_readlane_b32"
                         | "s_bcnt1_i32_b64" | "v_mbcnt_lo_u32_b32" | "v_mbcnt_hi_u32_b32")
                     && !matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some()));
+            let partial_safe = !reduction && insts().all(|i|
+                !matches!(i.name(), "ds_swizzle_b32" | "v_readlane_b32")
+                && !matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some()));
             let uniform = x.st.guards.iter().flatten().all(|g| g.is_none() || *g == Some(Bool::TRUE));
             let guarded_exchanges = exchange_only && p.blocks.len() == 1
                 && p.blocks[0].insts.iter().enumerate().all(|(n, i)| {
@@ -702,11 +705,11 @@ impl<'a> Lower<'a> {
                     g.is_none() || g == Some(Bool::TRUE)
                         || i.name() == "ds_bpermute_b32"
                             && g.is_some_and(|g| x.st.bools.support(g).iter()
-                                .all(|a| matches!(a, Atom::Constant(_))))
+                                .all(|a| matches!(a, Atom::Constant(_) | Atom::Lane(_))))
                 });
             portable_lanes = x.native.wave64
                 && (!scratch || (1..=1024).contains(&threads)
-                    && (threads.is_multiple_of(64) || exchange_only)
+                    && (threads.is_multiple_of(64) || partial_safe)
                     && (reduction || uniform || guarded_exchanges))
                 && console_lanes
                 && s.lds_dwords == 0
@@ -754,6 +757,10 @@ impl<'a> Lower<'a> {
                                             | 0x150..=0x16F),
                                         None => true,
                                     })
+                        }
+                        "v_cmpx_gt_u32" | "v_cmpx_eq_u32" if guarded_exchanges => {
+                            matches!(&i.fields, Fields::Valu(v) if v.dpp.is_none())
+                                && i.writes.iter().all(|&(r, _)| matches!(r, Reg::S(126..=127)))
                         }
                         "v_cmp_gt_u32" | "v_cmp_eq_u32" => {
                             matches!(&i.fields, Fields::Valu(v) if v.dpp.is_none())
@@ -2061,7 +2068,7 @@ impl<'a> Lower<'a> {
                 self.balloting.remove(&lo);
                 let bit = bit?;
                 let xy = if self.portable_lanes {
-                    // Only uniform, complete logical waves with private scratch.
+                    // Only uniform logical waves with private scratch.
                     if at != self.cur || self.s.lds_dwords == 0 {
                         return Err("a portable ballot outside uniform scratch code");
                     }
@@ -2107,6 +2114,18 @@ impl<'a> Lower<'a> {
         let own = self.s.m.element(c, lds, flat);
         let dst = self.s.m.element(c, lds, index);
         let hi = self.s.m.bin(c, Bin::Or, base, one);
+        // A one-lane tail has no second scratch slot. It cannot
+        // contribute a high-half bit, so read a valid slot and return zero.
+        let threads = self.s.threads.expect("portable compute").iter().product::<u32>();
+        let high_present = if threads % 64 == 1 {
+            let end = self.s.m.i32(threads);
+            Some(self.s.m.cmp(c, pred::IULT, hi, end))
+        } else {
+            None
+        };
+        let hi = if let Some(on) = high_present {
+            self.s.m.select(c, on, hi, base)
+        } else { hi };
         let lo_ptr = self.s.m.element(c, lds, base);
         let hi_ptr = self.s.m.element(c, lds, hi);
         let zero = self.s.m.i32(0);
@@ -2119,6 +2138,9 @@ impl<'a> Lower<'a> {
         self.s.op(c, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[mode]);
         let lo = self.s.m.load(c, lo_ptr);
         let hi = self.s.m.load(c, hi_ptr);
+        let hi = if let Some(on) = high_present {
+            self.s.m.select(c, on, hi, zero)
+        } else { hi };
         // A later ballot or bpermute must not overwrite a pending read.
         self.s.op(c, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[mode]);
         (lo, hi)
