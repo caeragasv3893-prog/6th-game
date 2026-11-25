@@ -102,7 +102,7 @@ standard features in 6.49 s and all features in 6.77 s.
 | Continuous integration | Windows branch push checks, both Clippy configurations, workspace tests and release build | Both local strict Clippy configurations passed; hosted CI result not confirmed |
 | Full title-to-host descriptor remapping | Not implemented | Pending design and workloads |
 | VRAM profiling | DXGI local/non-local process usage, budget, headroom and over-budget telemetry, logged at device creation and with frame statistics | PASS on revision `87f9bba`; local 11.66 MiB / 7123 MiB budget, non-local 24.81 MiB / 7095.58 MiB budget |
-| CPU snapshot memory | Configurable idle snapshot pool limit, budget-aware trimming and periodic logging | Implementation published; tests pending |
+| CPU snapshot memory | Configurable idle snapshot pool limit, budget-aware trimming and periodic logging | PASS on revision `571cf65`: both targeted pool tests and strict all-features Clippy (2.23 s) |
 | Additional shader coverage and rendering performance | Not implemented | Pending measured baseline |
 
 The fixed portable ABI is still 1,000,000 resource descriptors; it does not
