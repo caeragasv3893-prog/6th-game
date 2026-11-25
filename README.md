@@ -358,6 +358,32 @@ cargo test -p victory-gpu --lib --locked wave -- --test-threads=1 --nocapture
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 ```
 
+### Portable wave64 lane numbering (2026-11-25)
+
+A first conservative lowering path handles straight-line wave64 compute
+programs with no LDS, no lane-mask data reads or cross-lane exchanges,
+and a small allowlist of scalar setup, lane-local operations and dword
+stores. Literal all-ones MBCNT operations derive the logical console
+lane from the flattened group thread ID modulo 64. Group thread IDs
+retain their ordinary DXIL values. These shaders no longer require an
+exact physical wave width. Other programs retain the existing lowering
+and required wave-size checks.
+
+The new synthetic regression uses 128 threads and expects two sequences
+of lane numbers 0 through 63. It checks unrestricted PSV wave bounds and
+dispatch output on available hardware/WARP devices. The reference
+arithmetic was independently checked for all 128 threads; Rust compilation
+and dispatch validation are pending.
+
+This does not implement cross-wave ballots, reductions, lane exchange,
+LDS synchronization, or arbitrary EXEC-mask emulation. Coverage of real
+title shaders and frame-rate effects remains unknown.
+
+```powershell
+cargo test -p victory-shader --lib --locked wave64_literal_lane_numbering -- --test-threads=1 --nocapture
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+```
+
 ### Development roadmap
 
 - [x] Build the project on the NVIDIA test machine.
