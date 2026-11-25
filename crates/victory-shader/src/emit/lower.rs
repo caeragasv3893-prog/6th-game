@@ -514,18 +514,22 @@ fn portable_reduction_section(x: &Parts<'_>, partial: bool) -> bool {
         for &(_, v) in &i.reads {
             if defined.contains(&v) {
                 match sec.shapes.get(&v) {
-                    Some(Shape::Active(op, src, mask, _))
-                        if (integer_reduction_op(*op).is_some() || !partial && matches!(op, Op::MinF | Op::MaxF))
+                    Some(Shape::Active(op, src, mask, ident))
+                        if (integer_reduction_op(*op).is_some()
+                            || matches!(op, Op::MinF | Op::MaxF)
+                                && (!partial
+                                    || *op == Op::MinF && *ident == f32::INFINITY.to_bits()
+                                    || *op == Op::MaxF && *ident == f32::NEG_INFINITY.to_bits()))
                             && *mask == saved && !defined.contains(src) => {
                         live = true;
                     }
                     Some(Shape::Active(Op::AddF, src, mask, ident))
-                        if !partial && *mask == saved && !defined.contains(src)
+                        if (!partial || *ident == 0) && *mask == saved && !defined.contains(src)
                             && super::wave::ordered_sum(inside, v, *src, saved, *ident).is_some() => {
                         live = true;
                     }
                     Some(Shape::Half(Op::AddH, src, mask, ident, hi))
-                        if !partial && *mask == saved && !defined.contains(src) && *hi < 64
+                        if (!partial || *ident == 0) && *mask == saved && !defined.contains(src) && *hi < 64
                             && super::wave::ordered_half_sum(inside, v, *src, saved, *ident).is_some() => {
                         live = true;
                     }
@@ -682,8 +686,8 @@ impl<'a> Lower<'a> {
             // every thread must reach the group barriers.
             let threads = cs.threads.iter().product::<u32>();
             // Integer reductions and prefixes admit partial waves.
-            // Proven FP32 prefixes only depend on earlier existing lanes;
-            // ordered whole-wave FP32/FP16 sums still need full waves.
+            // Proven ordered FP sums and recognized FP extrema admit
+            // partial waves only with the explicit missing-lane identity.
             let reduction = x.native.wave64
                 && portable_reduction_section(x, !threads.is_multiple_of(64));
             let scratch = reduction || insts().any(|i| {
@@ -1462,7 +1466,7 @@ impl<'a> Lower<'a> {
                 return Ok(self.portable_prefix_sum(x, inclusive));
             }
             if matches!(op, Op::MinF | Op::MaxF) {
-                return Ok(self.portable_float_extrema(x, op == Op::MaxF));
+                return Ok(self.portable_float_extrema(x, op == Op::MaxF, id));
             }
             let rmw = integer_reduction_op(op).ok_or("a portable non-integer reduction")?;
             return Ok(self.portable_reduce(x, id, rmw));
@@ -2214,9 +2218,10 @@ impl<'a> Lower<'a> {
         let mut high_word = None;
         let low = self.s.m.i32(0xFFFF);
         let threads = self.s.threads.expect("portable compute").iter().product::<u32>();
-        // Only proven prefix graphs can reach this path with a partial
-        // group. Their live lane roots never depend on missing leaves.
-        // Give other roots defined inputs without out-of-bounds LDS loads.
+        // Proven prefixes use only existing earlier leaves. Proven sums
+        // admitted with a partial group have an explicit +0 mask identity.
+        // Missing leaves (including an absent FP16 high-half source) hold
+        // that identity, without an out-of-bounds LDS read.
         let end = (!threads.is_multiple_of(64)).then(|| self.s.m.i32(threads));
         for lane in 0..64 {
             if needed[lane] {
@@ -2301,20 +2306,38 @@ impl<'a> Lower<'a> {
     /// Fixed butterfly over the logical wave. Use the normal FP extrema
     /// helper, not integer ordering of float bit patterns. The eligible
     /// recognized section is uniform and has a full original EXEC mask.
-    fn portable_float_extrema(&mut self, value: V, max: bool) -> V {
+    fn portable_float_extrema(&mut self, value: V, max: bool, identity: V) -> V {
         let c = self.cur;
         let flat = self.mesh_thread();
         let lds = self.s.lds();
         let own = self.s.m.element(c, lds, flat);
         let mode = self.s.m.i32(1 | 8);
+        let threads = self.s.threads.expect("portable compute").iter().product::<u32>();
+        let end = (!threads.is_multiple_of(64)).then(|| self.s.m.i32(threads));
         let mut bits = value;
         for distance in [1, 2, 4, 8, 16, 32] {
             let d = self.s.m.i32(distance);
             let partner = self.s.m.bin(c, Bin::Xor, flat, d);
+            // In a partial wave, choose the first lane of the partner
+            // subtree. All its existing lanes already carry that subtree's
+            // result. An absent subtree supplies the original identity.
+            let (partner, present) = if let Some(end) = end {
+                let mask = self.s.m.i32(!(distance - 1));
+                let first = self.s.m.bin(c, Bin::And, partner, mask);
+                let on = self.s.m.cmp(c, pred::IULT, first, end);
+                (self.s.m.select(c, on, first, flat), Some(on))
+            } else {
+                (partner, None)
+            };
             let src = self.s.m.element(c, lds, partner);
             self.s.m.store(c, own, bits);
             self.s.op(c, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[mode]);
             let other = self.s.m.load(c, src);
+            let other = if let Some(on) = present {
+                self.s.m.select(c, on, other, identity)
+            } else {
+                other
+            };
             self.s.op(c, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[mode]);
             let a = self.as_float(other);
             let b = self.as_float(bits);
