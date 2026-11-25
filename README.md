@@ -806,6 +806,27 @@ cargo test -p victory-shader --lib --locked wave64_ -- --test-threads=1 --nocapt
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 ```
 
+### Ordered inclusive FP32 wave64 prefix scans (2026-11-25)
+
+The portable whole-wave recognizer now accepts inclusive FP32 prefixes
+when ordered replay proves the exact input set for each logical lane,
+without repeated inputs. Replay admits constant EXEC writes for the
+cross-row propagation steps but still rejects divergent DPP, unknown
+operands and unsupported arithmetic. All runtime barriers remain uniform.
+The lowering shares the original input words, evaluates the reachable
+addition graph in original operand order, then selects the result for
+the logical lane. Uniform sums retain their existing single-result
+path. The prefix path may generate substantially more arithmetic than
+a native scan; it is a correctness-first implementation.
+
+The synthetic regression uses two logical waves, cross-row propagation,
+rounding-sensitive values, signed zeros, infinities and NaNs. It checks
+unrestricted DXIL wave bounds and compares each lane to a CPU reference
+on hardware and WARP when available. Compilation, strict Clippy, DXIL
+validation and execution of this new test are pending. Exclusive FP32
+prefixes, general divergent sections, FP16 and performance remain open.
+No AMD hardware or title execution validation is implied.
+
 ### Development roadmap
 
 - [x] Build the project on the NVIDIA test machine.
