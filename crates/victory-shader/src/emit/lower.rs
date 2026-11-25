@@ -2306,7 +2306,7 @@ impl<'a> Lower<'a> {
             let valid = self.s.m.cmp(c, pred::IUGE, lane, distance);
             let prior = self.s.m.bin(c, Bin::Sub, flat, distance);
             let index = self.s.m.select(c, valid, prior, flat);
-            let (own, index) = if double_buffer && round % 2 == 1 {
+            let (own, index) = if double_buffer && !round.is_multiple_of(2) {
                 let offset = self.s.m.i32(threads);
                 (self.s.m.bin(c, Bin::Add, flat, offset), self.s.m.bin(c, Bin::Add, index, offset))
             } else {
@@ -2475,7 +2475,7 @@ impl<'a> Lower<'a> {
             } else {
                 (partner, None)
             };
-            let (own, partner) = if double_buffer && round % 2 == 1 {
+            let (own, partner) = if double_buffer && !round.is_multiple_of(2) {
                 let offset = self.s.m.i32(threads);
                 (self.s.m.bin(c, Bin::Add, flat, offset), self.s.m.bin(c, Bin::Add, partner, offset))
             } else {
@@ -3712,7 +3712,7 @@ impl<'a> Lower<'a> {
         let bank = self.portable_exchange_bank;
         let (dst, src) = if let Some(bank) = bank {
             self.portable_exchange_bank = Some(bank + 1);
-            if bank % 2 == 0 {
+            if bank.is_multiple_of(2) {
                 (flat, src)
             } else {
                 let offset = self.s.m.i32(threads);
