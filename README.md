@@ -981,9 +981,21 @@ prefix graphs to incomplete groups. Each live root depends only on
 existing earlier lanes; unused roots receive defined placeholder
 inputs via in-bounds scratch reads. Regression cases exercise ten
 partial sizes, three floating-point input sets and both prefix modes.
-Windows validation is pending. Whole-wave FP32/FP16 reductions on
-partial groups and arbitrary divergent control flow remain open;
-no title data or AMD validation is claimed.
+Windows validation passed at `f1ceb2a`: 22 targeted wave64 tests
+(17.77 s), all executed workspace tests (270 shader tests, four ignored)
+and the release build (16.37 s). The verification script completed.
+
+Revision `1155ca5` extends recognized partial-wave FP32 and FP16 sums
+with explicit positive-zero masked inputs, preserving the original
+arithmetic graph and per-step half rounding. An absent high-half source
+uses the original masked identity. Partial FP32 min/max require the
+corresponding infinity identity and use an existing representative of
+each partner subtree rather than indexing nonexistent threads. New
+tests include partial groups on either side of row and wave boundaries,
+NaNs, signed zeros, and FP16 cancellation that distinguishes per-step
+rounding from a single final rounding. These new paths await Windows
+validation. Arbitrary divergent control flow remains open; no title
+data or AMD validation is claimed.
 
 ### Development roadmap
 
