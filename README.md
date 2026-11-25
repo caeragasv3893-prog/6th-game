@@ -466,6 +466,46 @@ cargo test -p victory-shader --lib --locked wave64_ -- --test-threads=1 --nocapt
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 ```
 
+### Portable wave64 ballot (2026-11-25)
+
+The straight-line portable compute subset now accepts unmasked unsigned
+integer comparisons writing VCC, direct reads of their mask words and
+`s_bcnt1_i32_b64`. Each thread publishes its predicate bit in its own
+shared scratch dword. After a group barrier, each thread reconstructs
+the two 32-bit mask words in logical lane order. A second group barrier
+allows safe scratch reuse. The ordinary scalar population-count lowering
+then counts bits in both words.
+
+```mermaid
+flowchart TD
+    A["64 logical lane predicates"] --> B["One positioned bit per scratch slot"]
+    B --> C["Group barrier"]
+    C --> D["OR slots 0–31: low dword"]
+    C --> E["OR slots 32–63: high dword"]
+    D --> F["Two mask words"]
+    E --> F
+    F --> G["Group barrier: scratch reusable"]
+    F --> H["Population count of both words"]
+```
+
+The reference path is intentionally conservative: it reconstructs the
+mask using 64 shared-memory reads per participating thread, not a
+performance-optimized reduction. Complete logical waves, uniform
+straight-line flow and private scratch are required. Divergent EXEC,
+arbitrary mask operations and general reductions remain unsupported
+by this portable path.
+
+The new synthetic test checks two logical waves in a 128-thread group,
+two distinct comparisons, both mask words and a population count, with
+three dispatches per available hardware/WARP adapter. Independent
+reference arithmetic checked all 256 predicate bits. Compilation,
+DXIL validation and GPU execution remain pending.
+
+```powershell
+cargo test -p victory-shader --lib --locked wave64_ -- --test-threads=1 --nocapture
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+```
+
 ### Development roadmap
 
 - [x] Build the project on the NVIDIA test machine.
