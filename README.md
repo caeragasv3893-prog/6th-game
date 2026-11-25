@@ -88,8 +88,9 @@ companion path covers SRV reads, not all UAV writes or typed buffer accesses.
 **Phase 2 regression run: 705 passed, 0 failed, 11 ignored.** Windows release
 build succeeded in 17.71 s. These results apply to commit `3856c93`, before
 the subsequent Clippy-only type alias change. The nested HLE child test is
-not counted twice. Both Clippy runs stopped on the same type-complexity
-lint; a named handle-cache key has been committed and awaits revalidation.
+not counted twice. The type-complexity lint was resolved with a named
+handle-cache key. Both strict Clippy checks passed on revision `f76c2b9`:
+standard features in 6.49 s and all features in 6.77 s.
 
 | Work item | Implementation | Validation |
 |-----------|----------------|------------|
@@ -98,7 +99,7 @@ lint; a named handle-cache key has been committed and awaits revalidation.
 | Invalid raw buffer accesses | Check resource kind, write permission, alignment, size and overflow; use null views on invalid ranges | Boundary tests passed on Windows |
 | Shader descriptor metadata | Explicitly initialize stride/mark/address tables; clamp address indices and include full properties in handle cache key | 248 shader tests passed; 3 ignored |
 | Synthetic benchmarks | Descriptor allocation/release benchmark (100,000 cycles) | Not measured yet |
-| Continuous integration | Windows branch push checks, both Clippy configurations, workspace tests and release build | Workflow configured; no successful CI run confirmed. Local Clippy recheck pending |
+| Continuous integration | Windows branch push checks, both Clippy configurations, workspace tests and release build | Both local strict Clippy configurations passed; hosted CI result not confirmed |
 | Full title-to-host descriptor remapping | Not implemented | Pending design and workloads |
 | VRAM profiling, additional shader coverage and performance | Not implemented | Pending measured baseline |
 
