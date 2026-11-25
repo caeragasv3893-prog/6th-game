@@ -101,7 +101,8 @@ standard features in 6.49 s and all features in 6.77 s.
 | Synthetic benchmarks | Descriptor allocation/release benchmark (100,000 cycles) | PASS: 2.879 ms total, 28.79 ns per cycle (CPU allocator only) |
 | Continuous integration | Windows branch push checks, both Clippy configurations, workspace tests and release build | Both local strict Clippy configurations passed; hosted CI result not confirmed |
 | Full title-to-host descriptor remapping | Not implemented | Pending design and workloads |
-| VRAM profiling | DXGI local/non-local process usage, budget, headroom and over-budget telemetry, logged at device creation and with frame statistics | New code; Windows validation pending |
+| VRAM profiling | DXGI local/non-local process usage, budget, headroom and over-budget telemetry, logged at device creation and with frame statistics | PASS on revision `87f9bba`; local 11.66 MiB / 7123 MiB budget, non-local 24.81 MiB / 7095.58 MiB budget |
+| CPU snapshot memory | Configurable idle snapshot pool limit, budget-aware trimming and periodic logging | Implementation published; tests pending |
 | Additional shader coverage and rendering performance | Not implemented | Pending measured baseline |
 
 The fixed portable ABI is still 1,000,000 resource descriptors; it does not
@@ -119,7 +120,19 @@ fragmentation under real workloads or game FPS.
 VRAM telemetry selects the DXGI adapter by the D3D12 device's LUID and queries
 node zero in both memory segments. The budget is dynamic and is not the same
 as total installed VRAM. Logging does not change resource residency or impose
-a memory limit. See [DXGI QueryVideoMemoryInfo](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_4/nf-dxgi1_4-idxgiadapter3-queryvideomemoryinfo).
+a memory limit. The targeted telemetry test passed on the NVIDIA machine
+and strict all-features Clippy passed in 2.52 s on revision `87f9bba`.
+These readings describe the test process without title data, not gameplay.
+
+The idle CPU snapshot reuse pool now accepts `VICTORY_SNAPSHOT_POOL_MIB`
+(default 2048, 0 disables retaining non-empty buffers). A smaller budget
+may reduce retained system memory at the cost of more allocations and page
+faults. It does not cap active snapshots, total RAM or VRAM. Invalid or
+overflowing settings fall back to the default. A new periodic log reports
+idle capacity and the configured limit. Performance with a smaller pool
+has not been measured yet.
+
+See [DXGI QueryVideoMemoryInfo](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_4/nf-dxgi1_4-idxgiadapter3-queryvideomemoryinfo).
 
 Run the new checks and benchmark without game data:
 
@@ -130,6 +143,7 @@ cargo test --workspace --locked -- --test-threads=1
 cargo build --release -p victory --locked
 cargo test -p victory-gpu --release --locked benchmark_dynamic_descriptor_churn -- --ignored --nocapture
 cargo test -p victory-gpu --lib --locked video_memory_budget_reports_segments -- --nocapture
+cargo test -p victory-gpu --lib --locked snapshot_pool -- --nocapture
 ```
 
 ### Development roadmap
