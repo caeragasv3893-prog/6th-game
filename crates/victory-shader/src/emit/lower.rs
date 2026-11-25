@@ -461,10 +461,20 @@ fn portable_reduction_section(x: &Parts<'_>) -> bool {
             return exec_write
                 && matches!(src.first(), Some(Operand::Const(128..=208) | Operand::Literal(_)));
         }
+        // FP extrema can be reassociated for numeric values and quiet
+        // NaN classification, but a literal infinity is not an identity
+        // for NaN. Do not admit extrema with immediate operands.
+        if matches!(i.name(), "v_min_f32" | "v_max_f32") {
+            let Fields::Valu(v) = &i.fields else { return false };
+            if !v.src.iter().all(|o| matches!(o, Operand::Vector { .. } | Operand::Scalar { code: 0..=103, .. })) {
+                return false;
+            }
+        }
         matches!(&i.fields, Fields::Valu(_))
             && matches!(i.name(), "v_cndmask_b32" | "v_mov_b32" | "v_readlane_b32"
                 | "v_permlanex16_b32" | "v_add_nc_u32" | "v_sub_nc_u32" | "v_min_u32" | "v_max_u32"
-                | "v_min_i32" | "v_max_i32" | "v_and_b32" | "v_or_b32" | "v_xor_b32")
+                | "v_min_i32" | "v_max_i32" | "v_and_b32" | "v_or_b32" | "v_xor_b32"
+                | "v_min_f32" | "v_max_f32")
             && i.writes.iter().all(|&(r, _)| matches!(r, Reg::V(_) | Reg::S(0..=103)))
     }) {
         return false;
@@ -485,6 +495,7 @@ fn portable_reduction_section(x: &Parts<'_>) -> bool {
                 |&(r, _)| matches!(r, Reg::S(0..=103)),
             ),
             "v_mov_b32" | "v_lshlrev_b32" => matches!(&i.fields, Fields::Valu(v) if v.dpp.is_none()),
+            "buffer_load_dword" => !x.res.scalar.iter().any(|s| matches!(s.1.param, MEMORY | USER_DATA)),
             "s_waitcnt" | "s_endpgm" | "buffer_store_dword" => true,
             _ => false,
         };
@@ -495,8 +506,8 @@ fn portable_reduction_section(x: &Parts<'_>) -> bool {
             if defined.contains(&v) {
                 match sec.shapes.get(&v) {
                     Some(Shape::Active(op, src, mask, _))
-                        if integer_reduction_op(*op).is_some() && *mask == saved
-                            && !defined.contains(src) => {
+                        if (integer_reduction_op(*op).is_some() || matches!(op, Op::MinF | Op::MaxF))
+                            && *mask == saved && !defined.contains(src) => {
                         live = true;
                     }
                     Some(Shape::Prefix(Op::AddU, src, mask, 0, _))
@@ -1344,6 +1355,9 @@ impl<'a> Lower<'a> {
                 }
                 return Ok(self.portable_prefix_sum(x, inclusive));
             }
+            if matches!(op, Op::MinF | Op::MaxF) {
+                return Ok(self.portable_float_extrema(x, op == Op::MaxF));
+            }
             let rmw = integer_reduction_op(op).ok_or("a portable non-integer reduction")?;
             return Ok(self.portable_reduce(x, id, rmw));
         }
@@ -2042,6 +2056,32 @@ impl<'a> Lower<'a> {
             sum = self.s.m.bin(c, Bin::Add, sum, x);
         }
         if inclusive { sum } else { self.s.m.bin(c, Bin::Sub, sum, value) }
+    }
+
+    /// Fixed butterfly over the logical wave. Use the normal FP extrema
+    /// helper, not integer ordering of float bit patterns. The eligible
+    /// recognized section is uniform and has a full original EXEC mask.
+    fn portable_float_extrema(&mut self, value: V, max: bool) -> V {
+        let c = self.cur;
+        let flat = self.mesh_thread();
+        let lds = self.s.lds();
+        let own = self.s.m.element(c, lds, flat);
+        let mode = self.s.m.i32(1 | 8);
+        let mut bits = value;
+        for distance in [1, 2, 4, 8, 16, 32] {
+            let d = self.s.m.i32(distance);
+            let partner = self.s.m.bin(c, Bin::Xor, flat, d);
+            let src = self.s.m.element(c, lds, partner);
+            self.s.m.store(c, own, bits);
+            self.s.op(c, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[mode]);
+            let other = self.s.m.load(c, src);
+            self.s.op(c, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[mode]);
+            let a = self.as_float(other);
+            let b = self.as_float(bits);
+            let result = self.max_min(max, a, b);
+            bits = self.as_int(result);
+        }
+        bits
     }
 
     /// All logical-wave lanes contribute to one accumulator. Initialize
