@@ -993,9 +993,20 @@ corresponding infinity identity and use an existing representative of
 each partner subtree rather than indexing nonexistent threads. New
 tests include partial groups on either side of row and wave boundaries,
 NaNs, signed zeros, and FP16 cancellation that distinguishes per-step
-rounding from a single final rounding. These new paths await Windows
-validation. Arbitrary divergent control flow remains open; no title
-data or AMD validation is claimed.
+rounding from a single final rounding. Windows validation passed at `ec9484c`: 25 targeted wave64 tests
+(27.49 s), all executed workspace tests (273 shader tests, four ignored;
+155 GPU tests, three ignored) and the release build (16.95 s). The
+verification script completed.
+
+Revision `71242ac` extends explicit portable bpermute to a restricted
+multi-block subset with group-uniform scalar control flow. It excludes
+EXEC changes, lane-dependent branch predicates, scalar values produced
+by cross-lane operations, title LDS and indirect exits. Scalar loop
+counters and SCC branches are permitted under these restrictions.
+A regression executes a three-iteration loop with a skipped middle
+exchange, on group sizes 33, 64, 96 and 128. The new path awaits Windows
+compilation and runtime validation. Arbitrary lane-divergent control
+flow remains open; no title data or AMD validation is claimed.
 
 ### Development roadmap
 
