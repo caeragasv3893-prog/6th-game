@@ -665,7 +665,7 @@ fn wave64_bpermute_exchanges_values_across_warps() {
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
 
-/// End-to-end dispatch/readback timing, not GPU-only timestamps.
+/// End-to-end timing plus GPU timestamps around Dispatch.
 /// The zero-exchange control includes queue/resource creation, submission,
 /// synchronization and readback. All workloads write the same 128 dwords.
 /// Keep it opt-in so correctness CI is not sensitive to host load.
@@ -681,6 +681,7 @@ fn benchmark_wave64_portable_exchange() {
             continue;
         };
         let mut baseline = 0.0;
+        let mut gpu_baseline = 0.0;
         for exchanges in [0u32, 1, 8, 32, 64] {
             let mut words = vec![
                 0xBE84_0300, 0xBE85_0380,
@@ -716,20 +717,28 @@ fn benchmark_wave64_portable_exchange() {
                 assert_eq!(out[0], want);
             }
             let mut elapsed = Vec::new();
+            let mut gpu = Vec::new();
             for _ in 0..20 {
                 let start = std::time::Instant::now();
-                let out = host.dispatch(&root, &pso, &dispatch).unwrap();
+                let (out, gpu_ms) = host.dispatch_timed(&root, &pso, &dispatch).unwrap();
                 elapsed.push(start.elapsed());
+                gpu.push(gpu_ms);
                 assert_eq!(out[0], want);
             }
             elapsed.sort_unstable();
+            gpu.sort_by(f64::total_cmp);
             let median = (elapsed[9].as_secs_f64() + elapsed[10].as_secs_f64()) * 500.0;
             let p95 = elapsed[18].as_secs_f64() * 1000.0;
+            let gpu_median = (gpu[9] + gpu[10]) * 0.5;
+            let gpu_p95 = gpu[18];
             if exchanges == 0 {
                 baseline = median;
+                gpu_baseline = gpu_median;
             }
             eprintln!("{label}: {exchanges} exchanges, 128 threads, dispatch/readback median {median:.3} ms, p95 {p95:.3} ms, delta from control {:+.3} ms",
                 median - baseline);
+            eprintln!("{label}: {exchanges} exchanges, GPU timestamp median {gpu_median:.6} ms, p95 {gpu_p95:.6} ms, delta from control {:+.6} ms",
+                gpu_median - gpu_baseline);
         }
         ran += 1;
     }
