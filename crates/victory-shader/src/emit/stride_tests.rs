@@ -192,6 +192,16 @@ fn build_wave(
     threads: u32,
     wave64: bool,
 ) -> HostShader {
+    build_wave_with_metrics(words, layout, used, threads, wave64).0
+}
+
+fn build_wave_with_metrics(
+    words: &[u32],
+    layout: Vec<RootParam>,
+    used: Vec<UsedResource>,
+    threads: u32,
+    wave64: bool,
+) -> (HostShader, usize, u32) {
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64,
@@ -221,6 +231,8 @@ fn build_wave(
         view_marks: false,
     })
     .expect("lower");
+    let barriers = lowered.barrier_calls;
+    let scratch = lowered.scratch_dwords;
     let shader = HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
@@ -247,7 +259,7 @@ fn build_wave(
     } else {
         eprintln!("no dxil.dll; validation skipped");
     }
-    shader
+    (shader, barriers, scratch)
 }
 
 #[test]
@@ -670,6 +682,35 @@ fn wave64_bpermute_exchanges_values_across_warps() {
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
 
+/// Verify the emitted DXIL barrier budget even without a hardware adapter.
+#[test]
+fn wave64_exchange_barrier_budget() {
+    for threads in [33u32, 128] {
+        for exchanges in [0u32, 1, 2, 8, 32, 64] {
+            let mut words = vec![
+                0xBE84_0300, 0xBE85_0380,
+                0xF408_0202, 0xFA00_0000,
+                0x3404_0082, 0xBF8C_C07F,
+                0x7E06_0300,
+            ];
+            for _ in 0..exchanges {
+                words.extend([0xDACC_0004, 0x0300_0302, 0xBF8C_C07F]);
+            }
+            words.extend([0xE070_1000, 0x8002_0302, 0xBF81_0000]);
+            let (_, barriers, scratch) = build_wave_with_metrics(
+                &words,
+                vec![param(RootType::Table, 0)],
+                vec![entry(ResourceType::Uav, 4, 0)],
+                threads,
+                true,
+            );
+            assert_eq!(barriers, exchanges as usize, "{threads} threads, {exchanges} exchanges");
+            let banks = exchanges.min(2);
+            assert_eq!(scratch, banks * threads, "{threads} threads, {exchanges} exchanges");
+        }
+    }
+}
+
 /// Reuse both LDS banks repeatedly, including absent sources in partial
 /// logical waves and multiple independent logical waves in one group.
 #[test]
@@ -757,13 +798,15 @@ fn wave64_bpermute_group_uniform_branch_and_loop() {
             continue;
         };
         for threads in [33u32, 64, 96, 128] {
-            let shader = build_wave(
+            let (shader, barriers, scratch) = build_wave_with_metrics(
                 &words,
                 vec![param(RootType::Table, 0)],
                 vec![entry(ResourceType::Uav, 4, 0)],
                 threads,
                 true,
             );
+            assert_eq!(barriers, 4, "three publications and one edge retirement");
+            assert_eq!(scratch, 2 * threads);
             let c = crate::Container::parse(&shader.dxil).unwrap();
             let psv = c.part(crate::FourCC::PSV0).unwrap().data;
             assert_eq!(u32::from_le_bytes(psv[20..24].try_into().unwrap()), 0);
