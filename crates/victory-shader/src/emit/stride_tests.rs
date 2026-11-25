@@ -738,12 +738,13 @@ fn wave64_bpermute_group_uniform_branch_and_loop() {
         0x7E06_0300, // v3 = v0
         0xBE94_0383, // s20 = 3
         0xBF06_8214, // loop: s_cmp_eq_u32 s20, 2
-        0xBF85_0003, // skip the exchange on the middle iteration
-        0xDACC_0004, 0x0300_0302,
-        0xBF8C_C07F,
+        0xBF85_0009, // skip three exchanges on the middle iteration
+        0xDACC_0004, 0x0300_0302, 0xBF8C_C07F,
+        0xDACC_0004, 0x0300_0302, 0xBF8C_C07F,
+        0xDACC_0004, 0x0300_0302, 0xBF8C_C07F,
         0x8094_8114, // s_sub_u32 s20, s20, 1
         0xBF06_8014, // s_cmp_eq_u32 s20, 0
-        0xBF84_FFF8, // s_cbranch_scc0 -> loop
+        0xBF84_FFF2, // s_cbranch_scc0 -> loop
         0xE070_1000, 0x8002_0302,
         0xBF81_0000,
     ];
@@ -771,7 +772,7 @@ fn wave64_bpermute_group_uniform_branch_and_loop() {
                 |e| panic!("{label}: compute pipeline failed: {e}"),
             );
             let mut expected: Vec<u32> = (0..threads).collect();
-            for _ in 0..2 {
+            for _ in 0..6 {
                 expected = (0..threads).map(|i| {
                     let src = (i & !63) | ((i + 1) & 63);
                     expected.get(src as usize).copied().unwrap_or(0)
