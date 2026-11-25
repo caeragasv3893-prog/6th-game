@@ -715,8 +715,13 @@ per available adapter.
 This is an explicit instruction-sequence extension, not automatic
 floating-point whole-wave reduction recognition. General reassociation,
 FP16, divergent EXEC, denormal edge-case coverage for the new path and
-performance measurements remain open. Windows compilation, DXIL
-validation and hardware/WARP execution are pending.
+performance measurements remain open. Windows validation at revision
+`80a77c5` passed all nine targeted wave64 tests in 2.65 s, with
+zero failures. Both hardware and WARP explicitly passed the FP32
+add/min/max regression, including the rounding-sensitive inputs,
+signed zeros, infinities and NaN classification checks. Strict
+all-features Clippy passed in 3.24 s. Full workspace regression and
+release validation for this revision remain pending.
 
 ```powershell
 cargo test -p victory-shader --lib --locked wave64_ -- --test-threads=1 --nocapture
