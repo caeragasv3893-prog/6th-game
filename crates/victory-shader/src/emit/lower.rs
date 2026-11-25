@@ -524,9 +524,9 @@ fn portable_reduction_section(x: &Parts<'_>) -> bool {
                             && super::wave::ordered_sum(inside, v, *src, saved, *ident).is_some() => {
                         live = true;
                     }
-                    Some(Shape::Prefix(Op::AddF, src, mask, ident, true))
+                    Some(Shape::Prefix(Op::AddF, src, mask, ident, inclusive))
                         if *mask == saved && !defined.contains(src)
-                            && super::wave::ordered_prefix(inside, v, *src, saved, *ident).is_some() => {
+                            && super::wave::ordered_prefix(inside, v, *src, saved, *ident, *inclusive).is_some() => {
                         live = true;
                     }
                     Some(Shape::Prefix(Op::AddU, src, mask, 0, _))
@@ -713,7 +713,8 @@ impl<'a> Lower<'a> {
                         // Explicit FP32 exchanges preserve the original
                         // sequence of arithmetic instructions. Do not
                         // reassociate symbolic floating-point reductions.
-                        | "v_add_f32" | "v_min_f32" | "v_max_f32" => {
+                        | "v_add_f32" | "v_min_f32" | "v_max_f32"
+                        | "v_add_f16" | "v_min_f16" | "v_max_f16" => {
                             matches!(&i.fields, Fields::Valu(v) if v.dpp.is_none())
                         }
                         "v_cmp_gt_u32" | "v_cmp_eq_u32" => {
@@ -1260,11 +1261,11 @@ impl<'a> Lower<'a> {
                         tree.ok_or("an unrecognized ordered FP32 sum")
                             .and_then(|tree| self.portable_ordered_sum(src, tree))
                     }
-                    Some(super::wave::Shape::Prefix(super::wave::Op::AddF, src, mask, ident, true))
+                    Some(super::wave::Shape::Prefix(super::wave::Op::AddF, src, mask, ident, inclusive))
                         if self.portable_lanes => {
                         let end = self.sections[&b][&start].end;
                         let tree = super::wave::ordered_prefix(
-                            &self.x.p.blocks[b].insts[start + 1..end], w, src, mask, ident,
+                            &self.x.p.blocks[b].insts[start + 1..end], w, src, mask, ident, inclusive,
                         );
                         tree.ok_or("an unrecognized ordered FP32 prefix")
                             .and_then(|tree| self.portable_ordered_sum(src, tree))
@@ -2114,7 +2115,9 @@ impl<'a> Lower<'a> {
         let mode = self.s.m.i32(1 | 8);
         let mut needed = vec![false; 64 + tree.adds.len()];
         for &root in &tree.roots {
-            needed[root] = true;
+            if root != usize::MAX {
+                needed[root] = true;
+            }
         }
         for (i, &(a, b)) in tree.adds.iter().enumerate().rev() {
             if needed[64 + i] {
@@ -2142,14 +2145,19 @@ impl<'a> Lower<'a> {
                 values[64 + i] = Some(self.s.m.bin(c, Bin::Add, lhs, rhs));
             }
         }
-        let mut result = values[tree.roots[0]].expect("reachable sum result");
+        let zero = self.s.m.i32(0);
+        let zero = self.as_float(zero);
+        let root_value = |root: usize| {
+            if root == usize::MAX { zero } else { values[root].expect("reachable sum result") }
+        };
+        let mut result = root_value(tree.roots[0]);
         if !tree.roots.iter().all(|&root| root == tree.roots[0]) {
             let mask = self.s.m.i32(63);
             let logical = self.s.m.bin(c, Bin::And, flat, mask);
             for (lane, &root) in tree.roots.iter().enumerate().skip(1) {
                 let index = self.s.m.i32(lane as u32);
                 let on = self.s.m.cmp(c, pred::EQ, logical, index);
-                let x = values[root].expect("reachable prefix result");
+                let x = root_value(root);
                 result = self.s.m.select(c, on, x, result);
             }
         }
