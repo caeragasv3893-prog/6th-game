@@ -751,8 +751,15 @@ the current symbolic representation records the contributing lanes,
 not the original association tree, and reassociating sums can change
 rounding. Explicit FP32 addition remains supported as validated above.
 General signaling-NaN behavior, FP16, arbitrary divergent EXEC and
-performance remain unvalidated. Rust compilation, DXIL validation and
-hardware/WARP execution of this extension are pending.
+performance remain unvalidated. Windows validation at revision
+`0971818` compiled successfully and passed strict all-features Clippy
+(3.08 s). Nine of ten targeted wave64 tests passed. The new regression
+failed during descriptor tracking at offset 152, before GPU execution:
+its row-sum readlane instructions overwrote s[16:19], the output UAV
+descriptor. Revision `a6c47ea` moves those scalar temporaries to
+s[20:23], preserving the SRV, UAV and saved EXEC registers. The fix
+changes only the synthetic shader test, not resource validation or
+FP32 lowering. Revalidation is pending.
 
 ```powershell
 cargo test -p victory-shader --lib --locked wave64_ -- --test-threads=1 --nocapture
