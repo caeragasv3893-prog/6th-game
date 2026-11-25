@@ -809,15 +809,20 @@ fn benchmark_wave64_portable_exchange() {
 
 #[test]
 fn wave64_bpermute_partial_groups_and_masked_sources() {
-    check_masked_exchange(false);
+    check_masked_exchange(false, false);
 }
 
 #[test]
 fn wave64_bpermute_execz_skips_are_predicated() {
-    check_masked_exchange(true);
+    check_masked_exchange(true, false);
 }
 
-fn check_masked_exchange(skip: bool) {
+#[test]
+fn wave64_bpermute_execz_skips_with_local_alu() {
+    check_masked_exchange(true, true);
+}
+
+fn check_masked_exchange(skip: bool, alu: bool) {
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock().unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
@@ -845,12 +850,15 @@ fn check_masked_exchange(skip: bool) {
                     _ => {}
                 }
                 if skip {
-                    words.push(0xBF88_0003); // skip to EXEC restore
+                    words.push(if alu { 0xBF88_0004 } else { 0xBF88_0003 }); // skip to EXEC restore
                 }
                 words.extend([
                     0xDACC_0004, 0x0300_0002, // v3 = next lane's v0
                     0xBF8C_C07F,
                 ]);
+                if alu {
+                    words.push(0x4A06_0681); // v3 = v3 + 1 under the same EXEC
+                }
                 if mask_mode != 0 {
                     words.push(0xBEFE_04C1); // restore full EXEC
                 }
@@ -881,9 +889,12 @@ fn check_masked_exchange(skip: bool) {
                 };
                 let first = |i: u32| {
                     let src = (i & !63) | ((i + 1) & 63);
-                    if !active(i) { i }
-                    else if src < threads && active(src) { src }
-                    else { 0 }
+                    if !active(i) {
+                        i
+                    } else {
+                        let value = if src < threads && active(src) { src } else { 0 };
+                        value + u32::from(alu)
+                    }
                 };
                 let (root, pso) = host.compute_pipeline(&shader).unwrap_or_else(
                     |e| panic!("{label}: compute pipeline failed: {e}"),
@@ -904,7 +915,7 @@ fn check_masked_exchange(skip: bool) {
                 }
             }
         }
-        eprintln!("{label}: partial waves and constant/dynamic EXEC bpermute passed (execz skip={skip})");
+        eprintln!("{label}: partial waves and constant/dynamic EXEC bpermute passed (execz skip={skip}, local ALU={alu})");
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
