@@ -8485,15 +8485,9 @@ impl<'a> Lower<'a> {
     fn gather_first(&mut self, u: V, size: V) -> V {
         let c = self.cur;
         let f = self.as_float(u);
-        // Classify NaN by its bits; a floating-point self-compare can be
-        // folded by a driver assuming that NaNs are absent.
-        let bits = self.as_int(f);
-        let mask = self.s.m.i32(0x7FFF_FFFF);
-        let magnitude = self.s.m.bin(c, Bin::And, bits, mask);
-        let infinity = self.s.m.i32(0x7F80_0000);
-        let num = self.s.m.cmp(c, pred::IUGT, magnitude, infinity);
+        let num = self.s.m.cmp(c, pred::OEQ, f, f);
         let fz = self.s.m.f32(0);
-        let f = self.s.m.select(c, num, fz, f);
+        let f = self.s.m.select(c, num, f, fz);
         let (lo, hi) = (
             self.s.m.f32((-2.0f32).to_bits()),
             self.s.m.f32(2.0f32.to_bits()),
@@ -9032,6 +9026,44 @@ impl<'a> Lower<'a> {
                 return Err("a buffer result");
             };
             self.write(inst, Reg::V(reg), x, guard);
+            return Ok(());
+        }
+        // A byte-addressed read through a table's structured SRV still
+        // needs a structured DXIL handle. Treating that descriptor as raw
+        // is not portable: some drivers scale the address by its stride.
+        // Split into dwords so a read crossing an element boundary works.
+        if !typed && index.is_none()
+            && let Some(used) = used
+            && used.root == RootType::Table
+            && used.kind == ResourceType::Srv
+            && used.stride >= 4
+            && used.stride.is_multiple_of(4)
+        {
+            let stride = used.stride;
+            let h = self.handle(site, src, false, (12, stride))?;
+            let Operand::Vector { reg, .. } = *data else {
+                return Err("a buffer result");
+            };
+            let stride = self.s.m.i32(stride);
+            let mask = self.s.m.i8(1);
+            let align = self.s.m.i32(4);
+            for k in 0..count {
+                let delta = self.s.m.i32(4 * k);
+                let byte = self.s.m.bin(c, Bin::Add, off, delta);
+                let element = self.s.m.bin(c, Bin::UDiv, byte, stride);
+                let within = self.s.m.bin(c, Bin::URem, byte, stride);
+                let r = self.s.op(
+                    c,
+                    "rawBufferLoad.f32",
+                    Attr::ReadOnly,
+                    self.s.t.res_ret,
+                    139,
+                    &[h, element, within, mask, align],
+                );
+                let x = self.s.m.extract(c, r, 0);
+                let x = self.as_int(x);
+                self.write(inst, Reg::V(reg + k as u8), x, guard);
+            }
             return Ok(());
         }
         let r = if typed {
