@@ -679,7 +679,11 @@ impl<'a> Lower<'a> {
                         // DPP still requires the original fixed-width path.
                         "v_mov_b32" | "v_lshlrev_b32" | "v_add_nc_u32"
                         | "v_min_u32" | "v_max_u32" | "v_min_i32" | "v_max_i32"
-                        | "v_and_b32" | "v_or_b32" | "v_xor_b32" => {
+                        | "v_and_b32" | "v_or_b32" | "v_xor_b32"
+                        // Explicit FP32 exchanges preserve the original
+                        // sequence of arithmetic instructions. Do not
+                        // reassociate symbolic floating-point reductions.
+                        | "v_add_f32" | "v_min_f32" | "v_max_f32" => {
                             matches!(&i.fields, Fields::Valu(v) if v.dpp.is_none())
                         }
                         "v_cmp_gt_u32" | "v_cmp_eq_u32" => {
@@ -687,6 +691,7 @@ impl<'a> Lower<'a> {
                                 && i.writes.iter().all(|&(r, _)| matches!(r, Reg::S(106..=107)))
                         }
                         "ds_bpermute_b32" => matches!(&i.fields, Fields::Ds { gds: false, .. }),
+                        "buffer_load_dword" => !root_memory,
                         "s_waitcnt" | "s_endpgm" | "buffer_store_dword" => true,
                         _ => false,
                     }
