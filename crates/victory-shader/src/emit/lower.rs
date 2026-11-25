@@ -7305,7 +7305,7 @@ impl<'a> Lower<'a> {
                         return Err("v_mbcnt of a mask that is no ballot (console lane layout)");
                     }
                     self.s.flags |= flags::WAVE_OPS;
-                } else if self.s.mesh.is_none() {
+                } else if self.s.mesh.is_none() && !self.portable_lanes {
                     self.cross_lane(false)?;
                 }
                 let lane = self.lane_index();
