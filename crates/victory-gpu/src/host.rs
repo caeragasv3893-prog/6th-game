@@ -39,6 +39,7 @@ const RTV_RING: u32 = 1024;
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     memory_adapter: Option<IDXGIAdapter3>,
+    wave_support: Option<WaveSupport>,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
@@ -248,9 +249,12 @@ fn create() -> windows::core::Result<Host> {
                 None
             }
         };
+        let wave_support = query_wave_support(&device);
+        tracing::info!(?wave_support, "host shader wave capabilities");
         Ok(Host {
             device,
             memory_adapter,
+            wave_support,
             queue,
             fence,
             submitted: Mutex::new(0),
@@ -268,6 +272,37 @@ fn create() -> windows::core::Result<Host> {
             presenter: Mutex::new(Presentation::default()),
         })
     }
+}
+
+/// Wave lane limits reported by the actual host D3D12 device.
+#[derive(Debug, Clone, Copy)]
+struct WaveSupport {
+    ops: bool,
+    min: u32,
+    max: u32,
+}
+
+impl WaveSupport {
+    fn may_support(self, lanes: u32) -> bool {
+        self.ops && (self.min..=self.max).contains(&lanes)
+    }
+}
+
+fn query_wave_support(device: &ID3D12Device) -> Option<WaveSupport> {
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    // SAFETY: the query writes the specified feature structure.
+    unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS1,
+            (&raw mut options).cast(),
+            size_of_val(&options) as u32,
+        ).ok()?;
+    }
+    Some(WaveSupport {
+        ops: options.WaveOps.as_bool(),
+        min: options.WaveLaneCountMin,
+        max: options.WaveLaneCountMax,
+    })
 }
 
 /// Query the adapter actually backing this device, not the first GPU in
@@ -336,6 +371,30 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn wave_capability_limits_exclude_unsupported_widths() {
+        use super::WaveSupport;
+        let wave32 = WaveSupport { ops: true, min: 32, max: 32 };
+        assert!(wave32.may_support(32));
+        assert!(!wave32.may_support(64));
+        let both = WaveSupport { ops: true, min: 32, max: 64 };
+        assert!(both.may_support(32));
+        assert!(both.may_support(64));
+        assert!(!both.may_support(16));
+        assert!(!WaveSupport { ops: false, ..both }.may_support(32));
+    }
+
+    #[test]
+    fn host_wave_capabilities_are_reported() {
+        let host = super::host().expect("host D3D12 device");
+        let support = host.wave_support.expect("D3D12 OPTIONS1 wave capabilities");
+        eprintln!("wave operations: {}, minimum lanes: {}, maximum lanes: {}",
+                  support.ops, support.min, support.max);
+        if support.ops {
+            assert!(support.min > 0 && support.min <= support.max);
+        }
+    }
+
     #[test]
     fn video_memory_budget_reports_segments() {
         let Some(host) = super::host() else {
@@ -755,6 +814,12 @@ struct Deferred {
 }
 
 impl Host {
+    /// False only for a wave width excluded by known device capabilities.
+    /// A range is not a guarantee that every width in it is supported.
+    pub(crate) fn may_support_wave(&self, lanes: u32) -> bool {
+        self.wave_support.is_none_or(|support| support.may_support(lanes))
+    }
+
     /// Whether the host runs mesh shaders at shader model 6.6 (translated
     /// mesh shaders need both); logged once.
     pub(crate) fn mesh_shaders(&self) -> bool {
