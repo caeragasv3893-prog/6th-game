@@ -463,7 +463,7 @@ fn portable_reduction_section(x: &Parts<'_>) -> bool {
         }
         matches!(&i.fields, Fields::Valu(_))
             && matches!(i.name(), "v_cndmask_b32" | "v_mov_b32" | "v_readlane_b32"
-                | "v_permlanex16_b32" | "v_add_nc_u32" | "v_min_u32" | "v_max_u32"
+                | "v_permlanex16_b32" | "v_add_nc_u32" | "v_sub_nc_u32" | "v_min_u32" | "v_max_u32"
                 | "v_min_i32" | "v_max_i32" | "v_and_b32" | "v_or_b32" | "v_xor_b32")
             && i.writes.iter().all(|&(r, _)| matches!(r, Reg::V(_) | Reg::S(0..=103)))
     }) {
