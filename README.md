@@ -584,7 +584,11 @@ general lowering of the existing whole-wave `Shape::Active` or
 `Shape::Prefix` recognizer. DPP, divergent EXEC, floating-point
 reductions and arbitrary control flow still use the existing paths.
 Each exchange requires two group barriers; no speedup is claimed.
-Windows compilation, DXIL validation and GPU dispatch are pending.
+Windows validation at revision `b2a4846` passed all six targeted wave64
+tests in 0.83 s. Both hardware and WARP explicitly passed all eight
+integer reductions across two logical waves. Strict all-features Clippy
+passed in 3.32 s. Full workspace regression and release validation for
+this revision remain pending.
 
 ```powershell
 cargo test -p victory-shader --lib --locked wave64_ -- --test-threads=1 --nocapture
