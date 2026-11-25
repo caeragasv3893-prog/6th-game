@@ -241,7 +241,8 @@ struct Lower<'a> {
     console_lanes: bool,
     /// Straight-line wave64 code with portable numbering and optional LDS exchange.
     portable_lanes: bool,
-    /// Alternating private LDS bank for a proven straight-line exchange sequence.
+    /// Number of exchanges emitted in the current proven uniform block.
+    /// Its parity selects the alternating private LDS bank.
     portable_exchange_bank: Option<u32>,
     /// Pixel: an ordered section (POPS), whose UAVs the host makes
     /// rasterizer-ordered views.
@@ -873,21 +874,33 @@ impl<'a> Lower<'a> {
                     }
                 }));
             if portable_lanes && scratch {
-                // Only a straight-line sequence with no other scratch users
-                // can leave a read pending at the end of an exchange.
+                // Only blocks with no other scratch users can leave a
+                // read pending between exchanges. A uniform multi-block
+                // program retires the outstanding reads before each edge.
+                let linear = p.blocks.len() == 1 && matches!(p.blocks[0].exit, Exit::End);
+                let max_exchanges = p.blocks.iter().map(|b| b.insts.iter().filter(|i| {
+                    matches!(i.name(), "ds_bpermute_b32" | "ds_swizzle_b32" | "v_readlane_b32")
+                        || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
+                }).count()).max().unwrap_or(0);
                 let exchange_sequence = !reduction
-                    && p.blocks.len() == 1
-                    && matches!(p.blocks[0].exit, Exit::End)
-                    && super::wave::sections(p, 0).is_empty()
+                    && (linear || group_flow && max_exchanges > 1)
+                    && max_exchanges > 0
+                    && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty())
                     && insts().all(|i| {
                         !reads_mask_as_data(x.st, i)
                             && !matches!(i.name(), "s_bcnt1_i32_b64"
                                 | "v_mbcnt_lo_u32_b32" | "v_mbcnt_hi_u32_b32")
                     });
+                // Only scans/extrema with multiple rounds need a second
+                // bank. Ordered floating sums and atomic reductions keep
+                // the original allocation.
+                let scan_banks = reduction && super::wave::sections(p, 0).values().any(|sec| {
+                    use super::wave::{Op, Shape};
+                    sec.shapes.values().any(|shape| matches!(shape,
+                        Shape::Prefix(Op::AddU, ..) | Shape::Active(Op::MinF | Op::MaxF, ..)))
+                });
                 // Two banks need at most 8 KiB for 1024 group threads.
-                // Recognized scans/extrema also use them, with a trailing
-                // barrier to make their scratch available to other operations.
-                s.lds_dwords = if exchange_sequence || reduction {
+                s.lds_dwords = if scan_banks || exchange_sequence && max_exchanges > 1 {
                     2 * threads
                 } else {
                     threads
@@ -1667,6 +1680,9 @@ impl<'a> Lower<'a> {
         for &b in &order {
             self.cur = self.block[b].expect("reachable");
             self.cur_ir = b;
+            if self.portable_exchange_bank.is_some() {
+                self.portable_exchange_bank = Some(0);
+            }
             let preds: Vec<usize> = p.blocks[b]
                 .preds
                 .iter()
@@ -1714,6 +1730,15 @@ impl<'a> Lower<'a> {
                     continue;
                 }
                 i += 1;
+            }
+            // A successor (including a loop back edge) starts again at
+            // bank zero, regardless of which path led to it. Retire both
+            // banks before that edge; no reuse is possible at shader end.
+            if self.portable_exchange_bank.is_some_and(|n| n != 0)
+                && !matches!(self.x.st.exits[b], LaneExit::End)
+            {
+                let mode = self.s.m.i32(1 | 8);
+                self.s.op(self.cur, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[mode]);
             }
             self.mask_ok = self.mask_data == MaskData::Console;
             self.tail[b] = Some(self.cur);
@@ -3661,8 +3686,9 @@ impl<'a> Lower<'a> {
 
     /// Read a logical wave64 lane using private group scratch. Callers
     /// must prove that every group thread reaches the publication barrier.
-    /// Straight-line exchanges alternate banks: the next publication
-    /// barrier also retires the previous bank's readers before its reuse.
+    /// Exchanges in a proven uniform block alternate banks: the next
+    /// publication barrier retires the previous bank's readers before
+    /// its reuse. Block exits retire pending readers before any successor.
     /// Other paths keep the original trailing barrier.
     fn portable_read_lane(&mut self, x: V, lane: V) -> V {
         let c = self.cur;
@@ -3685,8 +3711,8 @@ impl<'a> Lower<'a> {
         let lds = self.s.lds();
         let bank = self.portable_exchange_bank;
         let (dst, src) = if let Some(bank) = bank {
-            self.portable_exchange_bank = Some(1 - bank);
-            if bank == 0 {
+            self.portable_exchange_bank = Some(bank + 1);
+            if bank % 2 == 0 {
                 (flat, src)
             } else {
                 let offset = self.s.m.i32(threads);
