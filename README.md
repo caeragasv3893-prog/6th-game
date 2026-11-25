@@ -759,7 +759,12 @@ its row-sum readlane instructions overwrote s[16:19], the output UAV
 descriptor. Revision `a6c47ea` moves those scalar temporaries to
 s[20:23], preserving the SRV, UAV and saved EXEC registers. The fix
 changes only the synthetic shader test, not resource validation or
-FP32 lowering. Revalidation is pending.
+FP32 lowering. Windows revalidation at revision `d9964fc` passed
+all ten targeted wave64 tests in 3.04 s with zero failures.
+Both hardware and WARP explicitly passed recognized FP32 MinF
+and MaxF, including the special-value regression. Strict all-features
+Clippy passed in 2.54 s. Full workspace regression, release build
+and performance validation remain pending.
 
 ```powershell
 cargo test -p victory-shader --lib --locked wave64_ -- --test-threads=1 --nocapture
