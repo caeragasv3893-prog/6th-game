@@ -737,7 +737,9 @@ impl<'a> Lower<'a> {
                 && p.blocks[0].insts.iter().enumerate().all(|(n, i)| {
                     let g = x.st.guards[0][n];
                     g.is_none() || g == Some(Bool::TRUE)
-                        || i.name() == "ds_bpermute_b32"
+                        || (i.name() == "ds_bpermute_b32"
+                            || crate::ir::predicated_exchange_alu(i.name(), &i.fields)
+                                && i.writes.iter().all(|&(r, _)| matches!(r, Reg::V(_))))
                             && g.is_some_and(|g| x.st.bools.support(g).iter()
                                 .all(|a| matches!(a, Atom::Constant(_) | Atom::Lane(_))))
                 });
