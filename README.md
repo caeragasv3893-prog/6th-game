@@ -71,11 +71,13 @@ Test machine: Windows, NVIDIA GeForce RTX 5060 Ti (8 GB), driver 610.88.
 | `victory-gpu` | 141 / 2 / 2 | Passed in latest workspace run; previously 143 / 0 / 2 after heap-limit change |
 | `victory-shader` | 244 / 3 / 3 | Passed in latest workspace run |
 | Full workspace | Initially stopped on GPU regressions | Passed (reported by the NVIDIA tester on 2026-11-25) |
+| Release build | Initial build succeeded | Updated release build succeeded in 24.38 s (Windows, 2026-11-25) |
 
 The NVIDIA tester reports that `cargo test --workspace --locked -- --test-threads=1`
 completed successfully after the raw companion SRV changes. Exact final test
-counts have not been supplied; no new totals are claimed. A fresh release build
-and title execution have not yet been validated. The one-million-descriptor limit is experimental: title
+counts have not been supplied; no new totals are claimed. The updated release
+build (`cargo build --release -p victory --locked`) succeeded in 24.38 seconds.
+Title execution has not yet been validated. The one-million-descriptor limit is experimental: title
 descriptors beyond the host capacity still need a correct mapping strategy.
 Raw companion descriptors consume additional heap slots; their lifetime,
 capacity, and behaviour during real workloads need validation. The new
@@ -88,7 +90,8 @@ companion path covers SRV reads, not all UAV writes or typed buffer accesses.
 - [x] Resolve the descriptor heap, dynamic slot, and null descriptor regressions.
 - [x] Validate the structured-buffer texture gather correction.
 - [x] Validate raw companion SRVs and rerun all workspace tests (tester reported success).
-- [ ] Build and verify the updated release executable.
+- [x] Compile the updated release executable (24.38 s).
+- [ ] Verify the release executable starts and its configuration is readable.
 - [ ] Verify descriptor capacity and resource lifetime under real title workloads.
 - [ ] Validate title boot, menus, world loading, and input on NVIDIA hardware.
 - [ ] Fix remaining world-rendering defects and profile frame times.
