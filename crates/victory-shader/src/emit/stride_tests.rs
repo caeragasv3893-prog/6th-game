@@ -601,6 +601,71 @@ fn wave64_literal_lane_numbering_runs_without_fixed_wave_width() {
 }
 
 #[test]
+fn wave64_bpermute_exchanges_values_across_warps() {
+    let words = [
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202, 0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+        0xDACC_0080, 0x0300_0002, // ds_bpermute_b32 v3, v2, v0 offset:128
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xDACC_0004, 0x0400_0302, // ds_bpermute_b32 v4, v2, v3 offset:4
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xE070_1000, 0x8002_0402, // buffer_store_dword v4, v2, s[8:11], 0 offen
+        0xBF81_0000, // s_endpgm
+    ];
+    let make = |threads| build_wave(
+        &words,
+        vec![param(RootType::Table, 0)],
+        vec![entry(ResourceType::Uav, 4, 0)],
+        threads,
+        true,
+    );
+    let shader = make(128);
+    let wave_bounds = |shader: &HostShader| {
+        let container = crate::Container::parse(&shader.dxil).unwrap();
+        let psv = container.part(crate::FourCC::PSV0).unwrap().data;
+        (
+            u32::from_le_bytes(psv[20..24].try_into().unwrap()),
+            u32::from_le_bytes(psv[24..28].try_into().unwrap()),
+        )
+    };
+    assert_eq!(wave_bounds(&shader), (0, u32::MAX));
+    // Partial logical waves cannot use the full-wave exchange lowering.
+    assert_eq!(wave_bounds(&make(96)), (64, 64));
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host.compute_pipeline(&shader).unwrap_or_else(
+            |e| panic!("{label}: compute pipeline failed: {e}"),
+        );
+        let want: Vec<u32> = (0..128).map(|i| (i / 64) * 64 + (i + 33) % 64).collect();
+        for _ in 0..3 {
+            let out = host.dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(vec![0; shader.user_data_dwords().max(1) as usize]))],
+                    views: &[View::RawUav(128)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            ).unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            assert_eq!(out[0], want, "{label}");
+        }
+        eprintln!("{label}: two logical waves, consecutive exchanges passed");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+#[test]
 fn a_half_buffer_load_by_index_reads_the_structured_element() {
     let mut code = HALF_LOAD_WAVE32.to_vec();
     // buffer_load_ushort v2, v0, s[8:11], 0 idxen offset:6.
