@@ -691,6 +691,38 @@ cargo test -p victory-shader --lib --locked wave64_ -- --test-threads=1 --nocapt
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 ```
 
+### Explicit FP32 wave64 reductions (2026-11-25)
+
+The uniform portable compute subset now accepts explicit
+`v_add_f32`, `v_min_f32` and `v_max_f32` alongside the existing
+shared-memory `ds_bpermute_b32` exchange, plus ordinary dword buffer
+loads when the program does not use the title-memory path. The
+translator keeps the original sequence of lane exchanges and FP32
+arithmetic instructions instead of replacing it with an unordered
+atomic reduction. Existing FP32 min/max lowering retains its
+signed-zero handling.
+
+The new GPU regression constructs three explicit butterfly reductions
+over two complete logical waves. Input buffers cover finite values
+with cancellation and rounding-sensitive terms, mixed signed zeros,
+infinities and quiet NaNs. A CPU reference follows the same butterfly
+order, compares non-NaN results by their exact bits and checks NaN
+classification without requiring identical payloads. The finite sum
+reference produces 16 and -8 in the two waves; independent arithmetic
+confirmed those values. The GPU regression checks 1,152 output words
+per available adapter.
+
+This is an explicit instruction-sequence extension, not automatic
+floating-point whole-wave reduction recognition. General reassociation,
+FP16, divergent EXEC, denormal edge-case coverage for the new path and
+performance measurements remain open. Windows compilation, DXIL
+validation and hardware/WARP execution are pending.
+
+```powershell
+cargo test -p victory-shader --lib --locked wave64_ -- --test-threads=1 --nocapture
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+```
+
 ### Development roadmap
 
 - [x] Build the project on the NVIDIA test machine.
