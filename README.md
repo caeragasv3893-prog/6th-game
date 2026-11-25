@@ -639,6 +639,54 @@ cargo test -p victory-shader --lib --locked wave64_ -- --test-threads=1 --nocapt
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 ```
 
+### Recognized integer reductions and prefix scans (2026-11-25)
+
+The previously validated recognized SUM regression now parameterizes
+all eight integer accumulator operations, including signed/unsigned
+extrema with high-bit input values. Each case verifies recognition,
+unrestricted PSV wave bounds and results from two logical waves.
+Windows validation of these expanded cases is pending.
+
+The portable recognized-section path now also accepts integer
+`Shape::Prefix(Op::AddU, ...)` with zero identity. Constant EXEC changes
+inside the symbolically simulated section are permitted; external code
+must still be uniform and all escaping values must be recognized
+integer reductions or prefixes of the original saved mask. No divergent
+group barriers are emitted inside the original masked instruction
+sequence. Only complete logical waves in straight-line compute shaders
+with private scratch are eligible.
+
+```mermaid
+flowchart LR
+    A["Lane values"] --> B["Add previous lane"]
+    B --> C["Distance 2"]
+    C --> D["Distance 4"]
+    D --> E["Distance 8"]
+    E --> F["Distance 16"]
+    F --> G["Distance 32"]
+    G --> H["Inclusive prefix"]
+    H --> I["Subtract own term for exclusive prefix"]
+```
+
+The scan uses six synchronized scratch rounds; each round reads the
+previous partial sum from a lower-numbered logical lane, substituting
+zero outside that wave. Two group barriers per round protect the
+shared scratch. Integer addition wraps modulo 2^32. The exclusive
+prefix subtracts the original term from the inclusive result.
+
+The new integration regression checks both recognized prefix forms
+on two independent logical waves and validates their DXIL wave bounds.
+An independent host-side model checked 65,536
+inclusive/exclusive lane results over 256 generated 128-thread groups.
+Rust compilation, symbolic recognition and GPU execution of the new
+regressions remain pending. Floating-point scans, arbitrary divergent
+EXEC, general control flow and performance measurements remain open.
+
+```powershell
+cargo test -p victory-shader --lib --locked wave64_ -- --test-threads=1 --nocapture
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+```
+
 ### Development roadmap
 
 - [x] Build the project on the NVIDIA test machine.
