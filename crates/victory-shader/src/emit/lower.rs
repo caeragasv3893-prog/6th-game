@@ -2216,7 +2216,7 @@ impl<'a> Lower<'a> {
                 let mask = self.s.m.i32(1 << bit);
                 let selected = self.s.m.bin(c, Bin::And, flat, mask);
                 let on = self.s.m.cmp(c, pred::NE, selected, zero);
-                choices = choices.chunks_exact(2).map(|pair| {
+                choices = choices.as_chunks::<2>().0.iter().map(|pair| {
                     if pair[0] == pair[1] { pair[0] }
                     else { self.s.m.select(c, on, pair[1], pair[0]) }
                 }).collect();
