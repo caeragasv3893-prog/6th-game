@@ -309,8 +309,22 @@ capacities, including the maximum u32. The oversized heap regression now
 checks persistent allocation and reuse even with all transient slots held.
 The Windows test log confirms 11 targeted descriptor tests passed, zero
 failed and one benchmark was ignored (0.52 s). Strict all-features Clippy
-also passed (0.15 s, incremental). A new full workspace run and release
-build have not yet been confirmed.
+also passed (0.15 s, incremental). Full workspace validation at revision
+`5e7d8eb` confirmed 720 passing tests, zero failures and 12 ignored
+(excluding the nested HLE subprocess and earlier runs). The release build
+completed successfully in 11.02 s.
+
+| Latest full Windows validation | Result |
+|---|---|
+| Workspace, all features | 720 passed, 0 failed, 12 ignored |
+| GPU | 158 passed, 4 ignored |
+| Shader | 250 passed, 3 ignored |
+| HLE | 143 passed |
+| Strict all-features Clippy | Passed |
+| Release build | Passed, 11.02 s |
+
+No live title execution, performance or native geometry/wave64 compatibility
+improvement has been established by these synthetic regressions.
 
 ```powershell
 cargo test -p victory-gpu --lib --locked descriptor::host::tests -- --test-threads=1 --nocapture
