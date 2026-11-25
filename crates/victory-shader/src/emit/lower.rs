@@ -8485,9 +8485,15 @@ impl<'a> Lower<'a> {
     fn gather_first(&mut self, u: V, size: V) -> V {
         let c = self.cur;
         let f = self.as_float(u);
-        let num = self.s.m.cmp(c, pred::OEQ, f, f);
+        // Classify NaN by its bits; a floating-point self-compare can be
+        // folded by a driver assuming that NaNs are absent.
+        let bits = self.as_int(f);
+        let mask = self.s.m.i32(0x7FFF_FFFF);
+        let magnitude = self.s.m.bin(c, Bin::And, bits, mask);
+        let infinity = self.s.m.i32(0x7F80_0000);
+        let num = self.s.m.cmp(c, pred::IUGT, magnitude, infinity);
         let fz = self.s.m.f32(0);
-        let f = self.s.m.select(c, num, f, fz);
+        let f = self.s.m.select(c, num, fz, f);
         let (lo, hi) = (
             self.s.m.f32((-2.0f32).to_bits()),
             self.s.m.f32(2.0f32.to_bits()),
