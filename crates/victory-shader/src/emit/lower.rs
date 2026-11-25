@@ -428,7 +428,7 @@ fn integer_reduction_op(op: super::wave::Op) -> Option<super::bitcode::Rmw> {
 /// allowed, but the surrounding code must reach it with the full group.
 /// All escaping section results must be recognized integer reductions,
 /// integer sum prefixes or FP32 extrema of values defined before the section.
-fn portable_reduction_section(x: &Parts<'_>) -> bool {
+fn portable_reduction_section(x: &Parts<'_>, partial: bool) -> bool {
     use super::wave::{Op, Shape};
     if x.p.blocks.len() != 1 {
         return false;
@@ -515,22 +515,22 @@ fn portable_reduction_section(x: &Parts<'_>) -> bool {
             if defined.contains(&v) {
                 match sec.shapes.get(&v) {
                     Some(Shape::Active(op, src, mask, _))
-                        if (integer_reduction_op(*op).is_some() || matches!(op, Op::MinF | Op::MaxF))
+                        if (integer_reduction_op(*op).is_some() || !partial && matches!(op, Op::MinF | Op::MaxF))
                             && *mask == saved && !defined.contains(src) => {
                         live = true;
                     }
                     Some(Shape::Active(Op::AddF, src, mask, ident))
-                        if *mask == saved && !defined.contains(src)
+                        if !partial && *mask == saved && !defined.contains(src)
                             && super::wave::ordered_sum(inside, v, *src, saved, *ident).is_some() => {
                         live = true;
                     }
                     Some(Shape::Half(Op::AddH, src, mask, ident, hi))
-                        if *mask == saved && !defined.contains(src) && *hi < 64
+                        if !partial && *mask == saved && !defined.contains(src) && *hi < 64
                             && super::wave::ordered_half_sum(inside, v, *src, saved, *ident).is_some() => {
                         live = true;
                     }
                     Some(Shape::Prefix(Op::AddF, src, mask, ident, inclusive))
-                        if *mask == saved && !defined.contains(src)
+                        if !partial && *mask == saved && !defined.contains(src)
                             && super::wave::ordered_prefix(inside, v, *src, saved, *ident, *inclusive).is_some() => {
                         live = true;
                     }
@@ -680,13 +680,16 @@ impl<'a> Lower<'a> {
             // Uniform ballots also admit partial waves. Other cross-lane
             // operations retain complete-wave and full-EXEC restrictions;
             // every thread must reach the group barriers.
-            let reduction = x.native.wave64 && portable_reduction_section(x);
+            let threads = cs.threads.iter().product::<u32>();
+            // Integer reductions and prefixes have exact identities for
+            // missing lanes; ordered FP32/FP16 graphs still need full waves.
+            let reduction = x.native.wave64
+                && portable_reduction_section(x, !threads.is_multiple_of(64));
             let scratch = reduction || insts().any(|i| {
                 matches!(i.name(), "ds_bpermute_b32" | "ds_swizzle_b32" | "v_readlane_b32")
                     || reads_mask_as_data(x.st, i)
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
             });
-            let threads = cs.threads.iter().product::<u32>();
             // Do not widen the eligibility of recognized reductions,
             // ballots, DPP, swizzle or readlane along with bpermute.
             let exchange_only = !reduction
@@ -709,7 +712,7 @@ impl<'a> Lower<'a> {
                 });
             portable_lanes = x.native.wave64
                 && (!scratch || (1..=1024).contains(&threads)
-                    && (threads.is_multiple_of(64) || partial_safe)
+                    && (threads.is_multiple_of(64) || partial_safe || reduction)
                     && (reduction || uniform || guarded_exchanges))
                 && console_lanes
                 && s.lds_dwords == 0
