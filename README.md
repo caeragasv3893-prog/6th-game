@@ -388,6 +388,31 @@ cargo test -p victory-shader --lib --locked wave64_literal_lane_numbering -- --t
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 ```
 
+### Portable wave64 lane exchange (2026-11-25)
+
+The conservative portable compute subset now supports unmasked
+`ds_bpermute_b32` using one scratch dword per group thread. Each logical
+64-lane wave has its own region. A group-wide shared-memory barrier
+separates writes from reads and a second barrier separates reads from
+reuse. This path requires straight-line code, no title LDS allocation,
+no nontrivial guards, complete 64-lane logical waves and at most 1024
+threads. Other cases retain their existing fixed-width lowering.
+
+A new synthetic regression checks two successive exchanges across the
+32-lane boundary, two independent logical waves, three dispatches on
+each available adapter and the fixed-width fallback for a 96-thread
+group. Reference arithmetic was checked for all 128 outputs. Rust
+compilation, DXIL validation, GPU execution and full regression tests
+remain pending. This is not general wave64 emulation; divergent exchange,
+ballots, reductions and title LDS behavior still require separate work.
+Group barriers may also add GPU cost; no performance improvement is
+claimed.
+
+```powershell
+cargo test -p victory-shader --lib --locked wave64_ -- --test-threads=1 --nocapture
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+```
+
 ### Development roadmap
 
 - [x] Build the project on the NVIDIA test machine.
