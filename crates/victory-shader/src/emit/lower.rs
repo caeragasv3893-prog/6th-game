@@ -200,7 +200,7 @@ struct Lower<'a> {
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
-    handles: HashMap<(usize, Site, u8, bool, u32), V>,
+    handles: HashMap<(usize, Site, u8, bool, (u32, u32)), V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -4505,6 +4505,11 @@ impl<'a> Lower<'a> {
             let val = if word < 2 {
                 let index = self.heap_index(site, k as u8, false)?;
                 let c = self.cur;
+                // The address table covers the portable heap, including a
+                // zero-filled last slot for out-of-range descriptor reads.
+                let last = self.s.m.i32(super::HEAP_VIEWS - 1);
+                let over = self.s.m.cmp(c, pred::IUGT, index, last);
+                let index = self.s.m.select(c, over, last, index);
                 let three = self.s.m.i32(3);
                 let at = self.s.m.bin(c, Bin::Shl, index, three);
                 let w = self.s.m.i32(4 * word);
@@ -4856,7 +4861,7 @@ impl<'a> Lower<'a> {
         }
         match src {
             Source::Loaded { load, first } => {
-                let key = (self.cur, *load, *first, sampler, props.0);
+                let key = (self.cur, *load, *first, sampler, props);
                 if let Some(&h) = self.handles.get(&key) {
                     return Ok(h);
                 }
