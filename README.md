@@ -46,6 +46,69 @@ What each part does today and what it still needs:
 | Textures | Console tiled layouts and detiling for the modes the title uses | Render-target metadata planes |
 | Series S mode | Runs through the menus to the loading screen | The world, as above |
 
+## NVIDIA compatibility progress (2026-11-25)
+
+**80% of the five original regression failures resolved (4/5).** This is
+a test-fix milestone, not a percentage of game compatibility or playability.
+
+`[████████░░] 80%`
+
+Development branch: [fix/nvidia-compatibility](https://github.com/caeragasv3893-prog/VIctory/tree/fix/nvidia-compatibility).
+Test machine: Windows, NVIDIA GeForce RTX 5060 Ti (8 GB), driver 610.88.
+
+| Milestone | Progress | Status |
+|-----------|----------|--------|
+| Descriptor heap capacity | 100% | Regression passed with the experimental 1,000,000-descriptor limit |
+| Dynamic descriptor slots | 100% | Regression passed |
+| Null buffer descriptors | 100% | Regression passed |
+| Texture gather | 100% | Targeted gather tests passed after matching structured SRV loads to their descriptors |
+| Runtime-selected buffer stride | Pending validation | Raw companion SRV implementation published; original structured view retained |
+
+### Test results
+
+| Test suite | Baseline (passed / failed / ignored) | Latest confirmed result |
+|------------|--------------------------------------|-------------------------|
+| `victory-gpu` | 141 / 2 / 2 | 143 / 0 / 2, after the heap-limit change |
+| `victory-shader` | 244 / 3 / 3 | Targeted gather tests passed; full suite not yet rerun on the latest revision |
+
+The latest runtime and shader changes still need a complete Windows build and
+regression run. The one-million-descriptor limit is experimental: title
+descriptors beyond the host capacity still need a correct mapping strategy.
+Raw companion descriptors consume additional heap slots; their lifetime,
+capacity, and behaviour during real workloads need validation. The new
+companion path covers SRV reads, not all UAV writes or typed buffer accesses.
+
+### Development roadmap
+
+- [x] Build the project on the NVIDIA test machine.
+- [x] Reproduce and isolate the five original graphics test failures.
+- [x] Resolve the descriptor heap, dynamic slot, and null descriptor regressions.
+- [x] Validate the structured-buffer texture gather correction.
+- [ ] Validate raw companion SRVs and rerun all workspace tests.
+- [ ] Verify descriptor capacity and resource lifetime under real title workloads.
+- [ ] Validate title boot, menus, world loading, and input on NVIDIA hardware.
+- [ ] Fix remaining world-rendering defects and profile frame times.
+- [ ] Establish stable, interactive gameplay.
+
+**Game validation on NVIDIA: not started.** No game files are available on
+this test machine. The upstream AMD gameplay observations above are historical
+and do not establish NVIDIA gameplay compatibility. No NVIDIA FPS or
+playability estimate is currently supported.
+
+### Reproduce the current regression checks
+
+```powershell
+git switch fix/nvidia-compatibility
+git pull --ff-only
+cargo test -p victory-shader --lib --locked a_heap_buffer_read -- --nocapture
+cargo test -p victory-shader --lib --locked gathers_at_a_level -- --nocapture
+cargo test --workspace --locked -- --test-threads=1
+```
+
+The milestone percentage is updated when an original failing test is
+confirmed passing; untested changes are not counted as complete. New
+regressions and gameplay validation are tracked separately.
+
 ## Getting started
 
 Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
