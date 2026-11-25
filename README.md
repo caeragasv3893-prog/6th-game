@@ -951,8 +951,15 @@ masked exchange regression failed on hardware (63 threads, constant
 EXEC, second exchange, lane 1: expected 33, received 0). Review found
 that constant masks used the physical host lane index. Revision
 `91c9955` switches that mask lookup to the logical lane index in the
-portable path. This fix awaits hardware/WARP validation; the fail-fast
-script stopped before workspace tests, release build and benchmark.
+portable path. The subsequent Windows validation passed all 21 targeted wave64 tests
+(13.17 s), all executed workspace tests (269 shader tests, four ignored)
+and the release build (18.61 s). The opt-in benchmark also passed:
+64 exchanges with 128 threads gave hardware median/p95 27.868/28.846 ms
+and WARP 0.250/0.358 ms. These are end-to-end dispatch/readback times,
+including fresh queue, resource and fence creation on every sample.
+Revision `0792d40` adds 0, 1, 8, 32 and 64 exchange workloads and a
+zero-exchange control delta to help distinguish fixed costs from
+exchange scaling; the expanded benchmark has not yet been run.
 Arbitrary divergent control flow and partial-wave floating-point
 recognition remain open; no title data or AMD validation is claimed.
 
