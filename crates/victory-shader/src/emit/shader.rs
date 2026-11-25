@@ -13,9 +13,12 @@ pub const SAMPLER_SPACE: u32 = 0;
 /// `t<root parameter index>` in this space.
 pub const ROOT_CBV_SPACE: u32 = 1;
 /// The root SRV slot (`t255` in [`ROOT_CBV_SPACE`], past every title root
-/// parameter) of the view-stride table: dword `i` is the byte stride of
-/// the buffer view at view-heap index `i`.
+/// parameter) of the view metadata table.
 pub const VIEW_STRIDES: u8 = 255;
+/// Two dwords (identity count, overflow length) precede the physical strides.
+pub const VIEW_STRIDE_BASE: u32 = 2;
+/// The overflow mappings begin here, with a zero sentinel before entry 0.
+pub const VIEW_REMAP_SENTINEL: u32 = VIEW_STRIDE_BASE + HEAP_VIEWS;
 /// Where the title-memory page table is bound: `t0` (a raw root SRV) in
 /// this space (see `emit` "Title memory").
 pub const MEMORY_SPACE: u32 = 2;

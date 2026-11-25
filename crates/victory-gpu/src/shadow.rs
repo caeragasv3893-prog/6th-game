@@ -52,45 +52,63 @@ pub(crate) struct Shadow {
 type Snapshot = (Vec<(usize, Vec<u8>)>, std::collections::HashSet<usize>);
 
 /// Snapshot memory kept for reuse (already touched, so no page faults).
-static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+static POOL: Mutex<SnapshotPool> = Mutex::new(SnapshotPool {
+    buffers: Vec::new(),
+    bytes: 0,
+});
+
+#[derive(Default)]
+struct SnapshotPool {
+    // Largest first, so a budget reduction discards smaller buffers first.
+    buffers: Vec<Vec<u8>>,
+    bytes: usize,
+}
+
+impl SnapshotPool {
+    fn take(&mut self, size: usize) -> Option<Vec<u8>> {
+        let end = self.buffers.partition_point(|v| v.capacity() >= size);
+        let mut buffer = self.buffers.remove(end.checked_sub(1)?);
+        self.bytes -= buffer.capacity();
+        buffer.clear();
+        Some(buffer)
+    }
+
+    fn insert(&mut self, buffer: Vec<u8>, limit: usize) {
+        let capacity = buffer.capacity();
+        if capacity == 0 || capacity > limit {
+            return;
+        }
+        let at = self.buffers.partition_point(|v| v.capacity() >= capacity);
+        self.buffers.insert(at, buffer);
+        if capacity <= limit.saturating_sub(self.bytes) {
+            self.bytes += capacity;
+            return;
+        }
+        let mut remaining = limit;
+        self.buffers.retain(|v| {
+            let capacity = v.capacity();
+            if capacity > remaining {
+                return false;
+            }
+            remaining -= capacity;
+            true
+        });
+        self.bytes = limit - remaining;
+    }
+}
 
 /// An empty buffer with room for `n` bytes, from the pool if it has one.
 fn pooled(n: usize) -> Vec<u8> {
-    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    let fit = pool
-        .iter()
-        .enumerate()
-        .filter(|(_, v)| v.capacity() >= n)
-        .min_by_key(|(_, v)| v.capacity())
-        .map(|(i, _)| i);
-    let mut v = match fit {
-        Some(i) => pool.swap_remove(i),
-        None => Vec::with_capacity(n),
-    };
-    v.clear();
-    v
+    let reused = POOL.lock().unwrap_or_else(|e| e.into_inner()).take(n);
+    reused.unwrap_or_else(|| Vec::with_capacity(n))
 }
 
 /// Returns a snapshot buffer to the pool, which keeps the largest up to
 /// [`POOL_BYTES`] in all: a world submission snapshots several copies, and
 /// fresh buffers cost a page fault per 4 KiB touched (millions per frame).
 fn give_back(v: Vec<u8>) {
-    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    pool.push(v);
-    trim_pool(&mut pool, pool_limit());
-}
-
-/// Keep the largest buffers first, without exceeding the byte budget.
-fn trim_pool(pool: &mut Vec<Vec<u8>>, limit: usize) {
-    pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
-    let mut remaining = limit;
-    pool.retain(|v| {
-        if v.capacity() > remaining {
-            return false;
-        }
-        remaining -= v.capacity();
-        true
-    });
+    let limit = pool_limit();
+    POOL.lock().unwrap_or_else(|e| e.into_inner()).insert(v, limit);
 }
 
 /// Default snapshot memory kept for reuse (not a limit on active snapshots).
@@ -118,8 +136,7 @@ fn pool_limit() -> usize {
 /// The idle CPU snapshot pool, separate from active snapshots and VRAM.
 pub(crate) fn log_pool() {
     let pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    let bytes = pool.iter().map(Vec::capacity).sum::<usize>();
-    tracing::info!(buffers = pool.len(), idle_mib = bytes as f64 / (1024.0 * 1024.0),
+    tracing::info!(buffers = pool.buffers.len(), idle_mib = pool.bytes as f64 / (1024.0 * 1024.0),
         limit_mib = pool_limit() / (1 << 20), "CPU snapshot reuse pool");
 }
 
@@ -1069,13 +1086,19 @@ mod tests {
 
     #[test]
     fn snapshot_pool_stays_within_budget_and_reuses_smaller_buffers() {
-        let mut pool = vec![Vec::with_capacity(128), Vec::with_capacity(64), Vec::with_capacity(32)];
-        let limit = pool[1].capacity() + pool[2].capacity();
-        trim_pool(&mut pool, limit);
-        assert_eq!(pool.len(), 2);
-        assert!(pool.iter().map(Vec::capacity).sum::<usize>() <= limit);
-        trim_pool(&mut pool, 0);
-        assert!(pool.is_empty());
+        let mut pool = SnapshotPool::default();
+        for capacity in [64, 32, 128, 256, 0] {
+            pool.insert(Vec::with_capacity(capacity), 192);
+        }
+        assert_eq!(pool.buffers.len(), 2);
+        assert_eq!(pool.bytes, 192);
+        assert_eq!(pool.take(33).unwrap().capacity(), 64);
+        assert_eq!(pool.bytes, 128);
+        assert!(pool.take(129).is_none());
+        assert_eq!(pool.take(1).unwrap().capacity(), 128);
+        pool.insert(Vec::with_capacity(32), 0);
+        assert!(pool.buffers.is_empty());
+        assert_eq!(pool.bytes, 0);
     }
 
     /// The title writes a constant under a range an earlier list of the

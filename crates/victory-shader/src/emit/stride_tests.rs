@@ -8,7 +8,17 @@
 use windows::Win32::Graphics::Direct3D12::D3D12_SAMPLER_DESC;
 
 use super::host::{Dispatch, Host, Root, Stride, View};
-use super::{HostShader, StaticSampler, VIEW_STRIDES, lower, validator};
+use super::{HostShader, StaticSampler, VIEW_REMAP_SENTINEL, VIEW_STRIDE_BASE, VIEW_STRIDES, lower, validator};
+
+fn view_metadata(strides: &[u32], identity: u32, overflow: &[u32]) -> Vec<u32> {
+    let mut data = vec![0; VIEW_REMAP_SENTINEL as usize + 1 + overflow.len()];
+    data[0] = identity;
+    data[1] = overflow.len() as u32;
+    let start = VIEW_STRIDE_BASE as usize;
+    data[start..start + strides.len()].copy_from_slice(strides);
+    data[VIEW_REMAP_SENTINEL as usize + 1..].copy_from_slice(overflow);
+    data
+}
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
@@ -264,8 +274,9 @@ fn a_heap_buffer_read_by_element_takes_the_views_stride() {
         let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
         for u in &shader.user_data {
             ud[u.index as usize] = match u.root {
-                // The buffer is at heap index 1, the UAV's table at 0.
-                RootType::Constants => 1,
+                // The title's heap index 3 maps to structured host view 1.
+                // The UAV's table already names host slot 0.
+                RootType::Constants => 3,
                 RootType::Table => 0,
                 other => panic!("unexpected user data {other:?}"),
             };
@@ -283,7 +294,7 @@ fn a_heap_buffer_read_by_element_takes_the_views_stride() {
                             1,
                             Root::View {
                                 srv: true,
-                                data: vec![4, 12 | (3 << 12), 4],
+                                data: view_metadata(&[4, 12 | (3 << 12), 4], 2, &[0, 1]),
                             },
                         ),
                     ],
@@ -331,21 +342,25 @@ fn a_heap_buffer_read_where_no_buffer_view_is_reads_zeros() {
             .compute_pipeline(&shader)
             .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
         let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
-        for u in &shader.user_data {
-            // The texture at heap index 1, the UAV's table at 0.
-            ud[u.index as usize] = u32::from(u.root == RootType::Constants);
+        for index in [1, 2, u32::MAX >> 5] {
+            for u in &shader.user_data {
+                ud[u.index as usize] = if u.root == RootType::Constants { index } else { 0 };
+            }
+            let dispatch = Dispatch {
+                // A texture, an unwritten overflow entry, then an out-of-range index.
+                roots: vec![
+                    (0, Root::Constants(ud.clone())),
+                    (1, Root::View { srv: true, data: view_metadata(&[4, 0], 2, &[0]) }),
+                ],
+                views: &views,
+                samplers: &[],
+                groups: [1, 1, 1],
+            };
+            let words = host
+                .dispatch(&root, &pso, &dispatch)
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            assert_eq!(words[0], [0; 32], "{label}, title slot {index}");
         }
-        let dispatch = Dispatch {
-            // Heap index 1 holds no buffer view: stride 0.
-            roots: vec![(0, Root::Constants(ud)), (1, Root::View { srv: true, data: vec![4, 0] })],
-            views: &views,
-            samplers: &[],
-            groups: [1, 1, 1],
-        };
-        let words = host
-            .dispatch(&root, &pso, &dispatch)
-            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
-        assert_eq!(words[0], [0; 32], "{label}");
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
@@ -403,7 +418,7 @@ fn a_constant_buffer_through_the_heap_reads_as_a_raw_buffer() {
                 &Dispatch {
                     // User data, then the stride table: heap index 1 holds a
                     // buffer view.
-                    roots: vec![(0, Root::Constants(ud)), (1, Root::View { srv: true, data: vec![4, 4] })],
+                    roots: vec![(0, Root::Constants(ud)), (1, Root::View { srv: true, data: view_metadata(&[4, 4], 2, &[]) })],
                     views: &views,
                     samplers: &[],
                     groups: [1, 1, 1],

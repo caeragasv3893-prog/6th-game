@@ -83,7 +83,7 @@ Raw companion descriptors consume additional heap slots; their lifetime,
 capacity, and behaviour during real workloads need validation. The new
 companion path covers SRV reads, not all UAV writes or typed buffer accesses.
 
-### Phase 2 — graphics runtime hardening (implementation in review)
+### Phase 2 — graphics runtime hardening (historical baseline)
 
 **Phase 2 regression run: 705 passed, 0 failed, 11 ignored.** Windows release
 build succeeded in 17.71 s. These results apply to commit `3856c93`, before
@@ -100,16 +100,13 @@ standard features in 6.49 s and all features in 6.77 s.
 | Shader descriptor metadata | Explicitly initialize stride/mark/address tables; clamp address indices and include full properties in handle cache key | 248 shader tests passed; 3 ignored |
 | Synthetic benchmarks | Descriptor allocation/release benchmark (100,000 cycles) | PASS: 2.879 ms total, 28.79 ns per cycle (CPU allocator only) |
 | Continuous integration | Windows branch push checks, both Clippy configurations, workspace tests and release build | Both local strict Clippy configurations passed; hosted CI result not confirmed |
-| Full title-to-host descriptor remapping | Not implemented | Pending design and workloads |
+| Title-to-host descriptor remapping | Identity mapping and temporary tables in this baseline | Direct heap overflow mapping added below |
 | VRAM profiling | DXGI local/non-local process usage, budget, headroom and over-budget telemetry, logged at device creation and with frame statistics | PASS on revision `87f9bba`; local 11.66 MiB / 7123 MiB budget, non-local 24.81 MiB / 7095.58 MiB budget |
 | CPU snapshot memory | Configurable idle snapshot pool limit, budget-aware trimming and periodic logging | PASS on revision `571cf65`: both targeted pool tests and strict all-features Clippy (2.23 s) |
 | Additional shader coverage and rendering performance | Not implemented | Pending measured baseline |
 
-The fixed portable ABI is still 1,000,000 resource descriptors; it does not
-expose all descriptors from a larger title heap. Oversized heaps are capped
-with a warning, not fully remapped. Unaligned raw companion offsets use a
-null view rather than risk invalid D3D12 descriptors; preserving those
-reads requires an aligned copy or explicit shader offset handling. Companion
+Unaligned raw companion offsets use a null buffer view. Supporting these
+offsets requires an aligned copy or explicit shader offset handling. Companion
 slots remain reserved for the lifetime of the heap to avoid premature reuse.
 
 The release-mode descriptor benchmark passed on the NVIDIA test machine at
@@ -146,6 +143,46 @@ cargo test -p victory-gpu --lib --locked video_memory_budget_reports_segments --
 cargo test -p victory-gpu --lib --locked snapshot_pool -- --nocapture
 ```
 
+### Direct resource heap remapping and memory reuse (2026-11-25)
+
+Oversized resource heaps keep an identity-mapped prefix and reserve 65,536
+physical slots for written overflow indices. The shader metadata table can
+address the first 1,048,576 title indices after that prefix. Slots are assigned
+when valid descriptor records are mirrored and stay stable across rewrites
+and clears until the heap is destroyed. The 1,000,000-descriptor D3D12 heap
+limits the number of simultaneously addressable views. Explicit tables use
+their existing temporary slots when needed, and sampler heaps keep their
+existing layout.
+
+The translator resolves the host slot before reading buffer strides, selecting
+raw companion SRVs, or recording writes. Synthetic shader tests compare the
+data read through a remapped structured SRV's raw companion and verify zeros
+for buffer reads from unmapped or out-of-range indices. Other missing resource
+types still use the existing default null descriptor. The shader source hash
+invalidates cached translations after this metadata layout change.
+
+The idle CPU snapshot pool keeps a running byte total and looks up the
+smallest fitting buffer in capacity order. It skips zero-capacity returns and
+keeps the largest buffers that fit the configured budget. Persistent
+descriptor slots now retain the resources they reference until replacement or
+clear. No title workload was available to measure RAM, VRAM, or frame times
+for these changes.
+
+| Check | Local result on Windows |
+|-------|-------------------------|
+| Workspace tests and doctests | 709 passed, 0 failed, 11 ignored. The nested HLE child test is counted once. |
+| `victory-gpu` | 151 passed, including sparse overflow slot assignment, rewrites, clears, and snapshot pool reuse |
+| `victory-shader` | 248 passed, including remapped and missing buffer reads checked on hardware and WARP |
+| Strict Clippy | Passed with default features and with `--all-features`, both across all workspace targets |
+| Builds | Release and `diag` with diagnostics passed |
+| `victory config` | The release executable parsed `victory.example.toml` and reported the deliberately absent game directory supplied through `VICTORY_GAME_DIR` |
+
+```powershell
+cargo test -p victory-gpu --lib --locked oversized_view_heap -- --nocapture
+cargo test -p victory-shader --lib --locked a_heap_buffer_read -- --test-threads=1 --nocapture
+cargo build --profile diag -p victory --features diagnostics --locked
+```
+
 ### Development roadmap
 
 - [x] Build the project on the NVIDIA test machine.
@@ -154,7 +191,7 @@ cargo test -p victory-gpu --lib --locked snapshot_pool -- --nocapture
 - [x] Validate the structured-buffer texture gather correction.
 - [x] Validate raw companion SRVs and rerun all workspace tests (tester reported success).
 - [x] Compile the updated release executable (24.38 s).
-- [ ] Verify the release executable starts and its configuration is readable.
+- [x] Verify the release executable starts and its configuration is readable.
 - [ ] Verify descriptor capacity and resource lifetime under real title workloads.
 - [ ] Validate title boot, menus, world loading, and input on NVIDIA hardware.
 - [ ] Fix remaining world-rendering defects and profile frame times.

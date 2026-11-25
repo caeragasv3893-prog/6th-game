@@ -68,9 +68,8 @@
 //!   the resource heap (no used-resource entry, so no stride) are raw too,
 //!   addressed at element × the view's stride + offset, the stride from
 //!   the view-stride table: root SRV `t`[`VIEW_STRIDES`] in
-//!   [`ROOT_CBV_SPACE`], listed in [`HostShader::root_srvs`], whose dword
-//!   `i` the host keeps at the byte stride of the buffer view at heap
-//!   index `i`.
+//!   [`ROOT_CBV_SPACE`], listed in [`HostShader::root_srvs`]. The stride of
+//!   physical heap index `i` is stored at dword [`VIEW_STRIDE_BASE`] + `i`.
 //! * **Constant buffers in the heap** (added 2026-11-24): scalar buffer
 //!   loads through a descriptor taken from the resource heap itself (root
 //!   type 5, so no used-resource entry) read a raw buffer view, not a
@@ -82,7 +81,9 @@
 //! * **Rectangle lists** ([`rectangle_gs`]): a geometry shader made from a
 //!   vertex shader's outputs completes each rectangle with its fourth
 //!   corner `v0 + v2 - v1`, as the console's hardware does.
-//! * **Heap indices** (added 2026-11-24) are clamped to [`HEAP_VIEWS`] − 1
+//! * **Heap indices** from direct resource loads first pass through the host's
+//!   identity range and overflow map in [`VIEW_STRIDES`]. A missing mapping
+//!   selects the reserved last descriptor. Physical indices are clamped to [`HEAP_VIEWS`] − 1
 //!   (samplers [`HEAP_SAMPLERS`] − 1): the host's heaps have at least that
 //!   many slots, those past its own null, so an index past the heap (data
 //!   still wrong; the console would read whatever memory follows its heap)
@@ -220,7 +221,8 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use sampler::StaticSampler;
 pub use shader::{
     HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, NULL_BUFFER_VIEW, ROOT_CBV_SPACE, SAMPLER_SPACE,
-    USER_DATA_SPACE, VIEW_MARK_NONE, VIEW_MARKS, VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES,
+    USER_DATA_SPACE, VIEW_MARK_NONE, VIEW_MARKS, VIEW_REMAP_SENTINEL, VIEW_STRIDE_BASE,
+    VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES,
 };
 
 /// The loop limit without an override: 2^20.

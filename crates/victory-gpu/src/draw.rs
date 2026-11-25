@@ -1096,7 +1096,9 @@ impl State {
             let Some(heap) = self.heap_of(table) else {
                 continue;
             };
-            let (Some(host), Some(index)) = (heap.host(), heap.index(end)) else {
+            let Some(host) = heap.host() else { continue };
+            let Some(index) = heap.index(end) else {
+                self.table_failed = true;
                 continue;
             };
             if index >= host.count() {
@@ -1131,6 +1133,10 @@ impl State {
                 .map(|u| u.table_offset_dwords / 8 + 1)
                 .max()
                 .unwrap_or(1);
+            if heap.index(table + u64::from(n - 1) * 32).is_none() {
+                self.table_failed = true;
+                continue;
+            }
             // The table and what its entries hold (record words).
             let key = {
                 use std::hash::{Hash, Hasher};

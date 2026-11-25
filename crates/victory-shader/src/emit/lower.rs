@@ -4347,13 +4347,45 @@ impl<'a> Lower<'a> {
     /// The byte stride of the buffer view at heap index `index`, from the
     /// view-stride table (`t`[`VIEW_STRIDES`]).
     fn stride_at(&mut self, index: V) -> V {
+        let packed = self.packed_stride(index);
         let c = self.cur;
-        let four = self.s.m.i32(4);
-        let at = self.s.m.bin(c, Bin::Mul, index, four);
-        let table = self.s.root_srv_handle(VIEW_STRIDES);
-        let packed = self.raw_dword(table, at);
         let mask = self.s.m.i32(0xFFF);
         self.s.m.bin(c, Bin::And, packed, mask)
+    }
+
+    fn packed_stride(&mut self, index: V) -> V {
+        let base = self.s.m.i32(super::VIEW_STRIDE_BASE);
+        let index = self.s.m.bin(self.cur, Bin::Add, index, base);
+        self.view_metadata(index)
+    }
+
+    fn view_metadata(&mut self, index: V) -> V {
+        let four = self.s.m.i32(4);
+        let at = self.s.m.bin(self.cur, Bin::Mul, index, four);
+        let table = self.s.root_srv_handle(VIEW_STRIDES);
+        self.raw_dword(table, at)
+    }
+
+    /// Direct resource indices name title slots. Table offsets already name
+    /// host slots and never pass through this translation.
+    fn remap_view(&mut self, index: V) -> V {
+        let c = self.cur;
+        let zero = self.s.m.i32(0);
+        let one = self.s.m.i32(1);
+        let identity = self.view_metadata(zero);
+        let length = self.view_metadata(one);
+        let offset = self.s.m.bin(c, Bin::Sub, index, identity);
+        let within = self.s.m.cmp(c, pred::IULT, offset, length);
+        let entry = self.s.m.bin(c, Bin::Add, offset, one);
+        let entry = self.s.m.select(c, within, entry, zero);
+        let base = self.s.m.i32(super::VIEW_REMAP_SENTINEL);
+        let entry = self.s.m.bin(c, Bin::Add, base, entry);
+        let mapped = self.view_metadata(entry);
+        let missing = self.s.m.cmp(c, pred::EQ, mapped, zero);
+        let null = self.s.m.i32(super::HEAP_VIEWS - 1);
+        let overflow = self.s.m.select(c, missing, null, mapped);
+        let direct = self.s.m.cmp(c, pred::IULT, index, identity);
+        self.s.m.select(c, direct, index, overflow)
     }
 
     /// Title memory at a raw GPU address (decision 0005: the unified-memory
@@ -5039,13 +5071,7 @@ impl<'a> Lower<'a> {
         let last = self.s.m.i32(super::HEAP_VIEWS - 1);
         let over = self.s.m.cmp(c, pred::IUGT, index, last);
         let index = self.s.m.select(c, over, last, index);
-        let four = self.s.m.i32(4);
-        let at = self.s.m.bin(c, Bin::Mul, index, four);
-        let table = self.s.root_srv_handle(VIEW_STRIDES);
-        let (iu, mask) = (self.s.m.undef(self.s.t.i32), self.s.m.i8(1));
-        let r = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139, &[table, at, iu, mask, four]);
-        let x = self.s.m.extract(c, r, 0);
-        let packed = self.as_int(x);
+        let packed = self.packed_stride(index);
         let mask = self.s.m.i32(0xFFF);
         let stride = self.s.m.bin(c, Bin::And, packed, mask);
         let zero = self.s.m.i32(0);
@@ -5153,10 +5179,11 @@ impl<'a> Lower<'a> {
             .scalar
             .get(&load)
             .ok_or("an untracked descriptor load")?;
-        match self.x.native.layout.get(a.param).map(|p| p.root) {
-            Some(RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap) => {}
+        let direct = match self.x.native.layout.get(a.param).map(|p| p.root) {
+            Some(RootType::ResourceHeap) if !sampler => true,
+            Some(RootType::Table | RootType::SamplerHeap) => false,
             _ => return Err("a descriptor outside the heaps"),
-        }
+        };
         let li: &Inst = &self.x.p.blocks[load.0].insts[load.1];
         let Fields::Flat {
             addr: Some(Operand::Vector { reg, .. }),
@@ -5183,7 +5210,8 @@ impl<'a> Lower<'a> {
             .i32((offset as i32 as u32).wrapping_add(4 * u32::from(first)));
         at = self.s.m.bin(c, Bin::Add, at, k);
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
-        Ok(self.s.m.bin(c, Bin::LShr, at, shift))
+        let index = self.s.m.bin(c, Bin::LShr, at, shift);
+        Ok(if direct { self.remap_view(index) } else { index })
     }
 
     /// The heap index of the descriptor at dword `first` of what the scalar
@@ -5193,10 +5221,11 @@ impl<'a> Lower<'a> {
             .scalar
             .get(&load)
             .ok_or("an untracked descriptor load")?;
-        match self.x.native.layout.get(a.param).map(|p| p.root) {
-            Some(RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap) => {}
+        let direct = match self.x.native.layout.get(a.param).map(|p| p.root) {
+            Some(RootType::ResourceHeap) if !sampler => true,
+            Some(RootType::Table | RootType::SamplerHeap) => false,
             _ => return Err("a descriptor outside the heaps"),
-        }
+        };
         let li: &Inst = &self.x.p.blocks[load.0].insts[load.1];
         let Fields::Smem {
             base,
@@ -5223,7 +5252,8 @@ impl<'a> Lower<'a> {
             addr = self.s.m.bin(c, Bin::Add, addr, so);
         }
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
-        Ok(self.s.m.bin(c, Bin::LShr, addr, shift))
+        let index = self.s.m.bin(c, Bin::LShr, addr, shift);
+        Ok(if direct { self.remap_view(index) } else { index })
     }
 
     fn valu(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
