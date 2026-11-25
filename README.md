@@ -239,8 +239,21 @@ views retain their existing paths.
 
 A new synthetic test reads 32 consecutive halfwords across 12-byte structured
 elements, using the hardware and WARP dispatch paths. The original raw SRV
-test is unchanged. This correction is implemented but has not yet been
-compiled or executed on Windows.
+test is unchanged. Both targeted tests passed on Windows in 0.36 s at
+revision `9458b43`.
+
+| Check | Confirmed Windows result |
+|-------|--------------------------|
+| Workspace tests with all features | 719 passed, 0 failed, 12 ignored |
+| GPU tests | 158 passed, 4 ignored |
+| Shader tests | 249 passed, 3 ignored |
+| Strict Clippy with all features | Passed in 3.37 s |
+| Release build | Passed in 15.69 s |
+
+The workspace count excludes the nested HLE subprocess test and earlier
+runs in the submitted log. The new halfword regression passed; byte loads
+share the implementation but do not yet have a dedicated new regression.
+No title execution or frame-rate improvement has been established.
 
 ```powershell
 cargo test -p victory-shader --lib --locked a_half_buffer_load -- --test-threads=1 --nocapture
