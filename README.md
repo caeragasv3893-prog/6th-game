@@ -510,6 +510,40 @@ cargo test -p victory-shader --lib --locked wave64_ -- --test-threads=1 --nocapt
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 ```
 
+### Wave64 ballot scratch optimization (2026-11-25)
+
+The previous validated reference path used 64 shared-memory loads per
+thread. The new path accumulates the same positioned predicate bits into
+two shared dwords per logical wave using atomic OR. Every thread
+clears its own scratch slot first, so each accumulator is initialized
+exactly once. The whole group synchronizes before accumulation,
+before reading the two words, and before reusing scratch.
+
+```mermaid
+flowchart TD
+    A["Clear private scratch slots"] --> B["Group barrier 1"]
+    B --> C["Atomic OR of each positioned predicate bit"]
+    C --> D["Group barrier 2"]
+    D --> E["Read low and high accumulator words"]
+    E --> F["Group barrier 3: safe reuse"]
+```
+
+| Operation per thread, per ballot | Reference | Atomic OR path |
+| --- | ---: | ---: |
+| Explicit scratch loads | 64 | 2 |
+| Scratch stores | 1 | 1 |
+| Shared atomic read-modify-write | 0 | 1 |
+| Group barriers | 2 | 3 |
+
+This eliminates 62 of 64 explicit loads (96.875%); it does not
+establish a GPU speedup. Atomic contention and the extra group barrier
+may offset the reduction. Scratch size and eligible shader subset are
+unchanged. The regression now also tests isolated bit 31 and bit 63,
+including clearing masks after a previous ballot. A host-side arithmetic
+model checked 10000 generated masks against a 64-bit reference.
+Windows compilation, DXIL validation, dispatch and performance
+measurements are pending for this optimization.
+
 ### Development roadmap
 
 - [x] Build the project on the NVIDIA test machine.
