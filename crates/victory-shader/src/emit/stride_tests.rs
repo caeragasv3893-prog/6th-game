@@ -177,9 +177,19 @@ fn build(
     used: Vec<UsedResource>,
     threads: u32,
 ) -> HostShader {
+    build_wave(words, layout, used, threads, false)
+}
+
+fn build_wave(
+    words: &[u32],
+    layout: Vec<RootParam>,
+    used: Vec<UsedResource>,
+    threads: u32,
+    wave64: bool,
+) -> HostShader {
     let native = NativeProgram {
         stage: HwStage::Cs,
-        wave64: false,
+        wave64,
         vgprs: 8,
         layout,
         used,
@@ -536,6 +546,60 @@ fn a_half_buffer_load_through_structured_srv_reads_the_half_at_its_address() {
 }
 
 /// An indexed sub-dword load selects the element before extracting its field.
+#[test]
+fn wave64_literal_lane_numbering_runs_without_fixed_wave_width() {
+    let words = [
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202, 0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+        0xD765_0001, 0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+        0xD766_0001, 0x0002_02C1, // v_mbcnt_hi_u32_b32 v1, -1, v1
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xE070_1000, 0x8002_0102, // buffer_store_dword v1, v2, s[8:11], 0 offen
+        0xBF81_0000, // s_endpgm
+    ];
+    let shader = build_wave(
+        &words,
+        vec![param(RootType::Table, 0)],
+        vec![entry(ResourceType::Uav, 4, 0)],
+        128,
+        true,
+    );
+    let container = crate::Container::parse(&shader.dxil).unwrap();
+    let psv = container.part(crate::FourCC::PSV0).unwrap().data;
+    assert_eq!(u32::from_le_bytes(psv[20..24].try_into().unwrap()), 0);
+    assert_eq!(u32::from_le_bytes(psv[24..28].try_into().unwrap()), u32::MAX);
+
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host.compute_pipeline(&shader).unwrap_or_else(
+            |e| panic!("{label}: compute pipeline failed: {e}"),
+        );
+        let out = host.dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(vec![0; shader.user_data_dwords().max(1) as usize]))],
+                views: &[View::RawUav(128)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        ).unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        let want: Vec<u32> = (0..128).map(|i| i % 64).collect();
+        assert_eq!(out[0], want, "{label}");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
 #[test]
 fn a_half_buffer_load_by_index_reads_the_structured_element() {
     let mut code = HALF_LOAD_WAVE32.to_vec();
