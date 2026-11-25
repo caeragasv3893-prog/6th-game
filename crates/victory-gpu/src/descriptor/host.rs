@@ -98,6 +98,8 @@ const DYNAMIC: u32 = 1 << 18;
 /// The dynamic slots of a heap whose host would not take [`DYNAMIC`] more
 /// (a capped heap, NVIDIA): the title's slots keep their room first.
 const MIN_DYNAMIC: u32 = 1 << 16;
+/// Reserve space for long-lived copy views and structured SRV companions.
+const MIN_PERSISTENT: u32 = 1 << 16;
 /// Cap the host slots and upload memory reserved for oversized title heaps.
 const OVERFLOW_SLOTS: u32 = 1 << 16;
 const OVERFLOW_ENTRIES: u32 = 1 << 20;
@@ -112,9 +114,10 @@ struct Mirrored {
 /// the last slot outside the title, transient, and persistent allocators.
 fn view_heap_layout(requested: u32) -> (u32, u32, u32) {
     let end = victory_shader::emit::NULL_BUFFER_VIEW - 1;
-    let overflow = if requested > end - MIN_DYNAMIC { OVERFLOW_SLOTS } else { 0 };
-    let count = requested.min(end - MIN_DYNAMIC - overflow);
-    let dynamic = DYNAMIC.min(end - count - overflow);
+    let title_limit = end - MIN_DYNAMIC - MIN_PERSISTENT;
+    let overflow = if requested > title_limit { OVERFLOW_SLOTS } else { 0 };
+    let count = requested.min(title_limit - overflow);
+    let dynamic = DYNAMIC.min(end - count - overflow - MIN_PERSISTENT);
     (count, dynamic, overflow)
 }
 
@@ -359,25 +362,29 @@ impl HostHeap {
         Some(self.count + first as u32)
     }
 
-    /// Two consecutive slots (view heaps only) kept until
-    /// [`HostHeap::free_pair`]: past the dynamic slots where the heap has
-    /// room (a host copy's views, `crate::memory`, for as long as it
-    /// lives), else dynamic ones.
+    /// Two consecutive slots (view heaps only) in the persistent range.
+    fn persistent_pair(&self) -> Option<u32> {
+        if self.sampler {
+            return None;
+        }
+        let mut pairs = self.pairs.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(index) = pairs.1.pop() {
+            return Some(index);
+        }
+        if pairs.0 + 2 <= self.pairs_end {
+            pairs.0 += 2;
+            return Some(pairs.0 - 2);
+        }
+        None
+    }
+
+    /// Two consecutive slots kept until [`HostHeap::free_pair`]: persistent
+    /// slots first (host copies), with dynamic slots as a fallback.
     pub(crate) fn pair(&self) -> Option<u32> {
         if self.sampler {
             return None;
         }
-        {
-            let mut pairs = self.pairs.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(index) = pairs.1.pop() {
-                return Some(index);
-            }
-            if pairs.0 + 2 <= self.pairs_end {
-                pairs.0 += 2;
-                return Some(pairs.0 - 2);
-            }
-        }
-        self.dynamic(2)
+        self.persistent_pair().or_else(|| self.dynamic(2))
     }
 
     /// Gives back a pair [`HostHeap::pair`] returned.
@@ -519,8 +526,8 @@ impl HostHeap {
             let alias = if let Some(spare) = aliases.spare.take() {
                 spare
             } else {
-                let Some(first) = self.pair() else {
-                    tracing::warn!(index, "no descriptor slots for raw SRV companion");
+                let Some(first) = self.persistent_pair() else {
+                    tracing::warn!(index, "no persistent descriptor slots for raw SRV companion");
                     return null;
                 };
                 aliases.spare = Some(first + 1);
@@ -1623,17 +1630,19 @@ mod tests {
     fn portable_heap_layout_reserves_null_and_dynamic_slots() {
         let end = victory_shader::emit::NULL_BUFFER_VIEW - 1;
         for requested in [0, 4, end - DYNAMIC, end - DYNAMIC + 1,
+                          end - MIN_DYNAMIC - MIN_PERSISTENT,
+                          end - MIN_DYNAMIC - MIN_PERSISTENT + 1,
                           end - MIN_DYNAMIC, end, u32::MAX] {
             let (count, dynamic, overflow) = view_heap_layout(requested);
             assert!(count <= requested);
             assert!((MIN_DYNAMIC..=DYNAMIC).contains(&dynamic));
-            assert!(count + dynamic + overflow <= end);
-            assert_eq!(count, requested.min(end - MIN_DYNAMIC - overflow));
+            assert!(count + dynamic + overflow + MIN_PERSISTENT <= end);
+            assert_eq!(count, requested.min(end - MIN_DYNAMIC - MIN_PERSISTENT - overflow));
         }
         assert_eq!(view_heap_layout(4), (4, DYNAMIC, 0));
         assert_eq!(
             view_heap_layout(u32::MAX),
-            (end - MIN_DYNAMIC - OVERFLOW_SLOTS, MIN_DYNAMIC, OVERFLOW_SLOTS),
+            (end - MIN_DYNAMIC - MIN_PERSISTENT - OVERFLOW_SLOTS, MIN_DYNAMIC, OVERFLOW_SLOTS),
         );
     }
 
@@ -1644,6 +1653,16 @@ mod tests {
             eprintln!("no host descriptor heap; skipped");
             return;
         };
+        // A capped heap must still have room for long-lived companions,
+        // even when all transient slots are held by command lists.
+        let all = heap.dynamic(heap.dynamic).unwrap();
+        let pair = heap.persistent_pair().unwrap();
+        assert_eq!(pair, heap.overflow_end);
+        heap.free_pair(pair);
+        assert_eq!(heap.persistent_pair(), Some(pair));
+        heap.free_pair(pair);
+        assert_eq!(heap.dynamic(1), None);
+        heap.release(all, heap.dynamic);
         let title_slot = end - 2;
         let physical = heap.count + heap.dynamic;
         let mut words = [0u32; 8];
