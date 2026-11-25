@@ -676,22 +676,23 @@ fn wave64_bpermute_partial_groups_and_masked_sources() {
             continue;
         };
         for threads in [1u32, 31, 33, 63, 65, 96, 127, 128] {
-            for masked in [false, true] {
+            for mask_mode in 0..3 {
                 let mut words = vec![
                     0xBE84_0300, 0xBE85_0380,
                     0xF408_0202, 0xFA00_0000,
                     0x3404_0082, 0xBF8C_C07F,
                     0x7E06_0300, // v3 = v0
                 ];
-                if masked {
-                    // Only odd lanes of the low 32 are active.
-                    words.extend([0xBEFE_04FF, 0xAAAA_AAAA]);
+                match mask_mode {
+                    1 => words.extend([0xBEFE_04FF, 0xAAAA_AAAA]),
+                    2 => words.push(0x7DA8_00A8), // v_cmpx_gt_u32 exec, 40, v0
+                    _ => {}
                 }
                 words.extend([
                     0xDACC_0004, 0x0300_0002, // v3 = next lane's v0
                     0xBF8C_C07F,
                 ]);
-                if masked {
+                if mask_mode != 0 {
                     words.push(0xBEFE_04C1); // restore full EXEC
                 }
                 words.extend([
@@ -711,16 +712,18 @@ fn wave64_bpermute_partial_groups_and_masked_sources() {
                 let c = crate::Container::parse(&shader.dxil).unwrap();
                 let psv = c.part(crate::FourCC::PSV0).unwrap().data;
                 assert_eq!(u32::from_le_bytes(psv[20..24].try_into().unwrap()), 0,
-                    "{label}: threads={threads}, masked={masked}");
+                    "{label}: threads={threads}, mask_mode={mask_mode}");
                 assert_eq!(u32::from_le_bytes(psv[24..28].try_into().unwrap()), u32::MAX);
+                let active = |i: u32| match mask_mode {
+                    1 => (i & 63) < 32 && i & 1 != 0,
+                    2 => i < 40,
+                    _ => true,
+                };
                 let first = |i: u32| {
-                    let lane = i & 63;
-                    if masked {
-                        if lane < 32 && lane & 1 != 0 { 0 } else { i }
-                    } else {
-                        let src = (i & !63) | ((lane + 1) & 63);
-                        if src < threads { src } else { 0 }
-                    }
+                    let src = (i & !63) | ((i + 1) & 63);
+                    if !active(i) { i }
+                    else if src < threads && active(src) { src }
+                    else { 0 }
                 };
                 let (root, pso) = host.compute_pipeline(&shader).unwrap_or_else(
                     |e| panic!("{label}: compute pipeline failed: {e}"),
@@ -735,13 +738,72 @@ fn wave64_bpermute_partial_groups_and_masked_sources() {
                     let partner = i ^ 32;
                     let want = if partner < threads { first(partner) } else { 0 };
                     assert_eq!(out[0][i as usize], first(i),
-                        "{label}: first exchange, threads={threads}, masked={masked}, lane={i}");
+                        "{label}: first exchange, threads={threads}, mask_mode={mask_mode}, lane={i}");
                     assert_eq!(out[0][128 + i as usize], want,
-                        "{label}: second exchange, threads={threads}, masked={masked}, lane={i}");
+                        "{label}: second exchange, threads={threads}, mask_mode={mask_mode}, lane={i}");
                 }
             }
         }
-        eprintln!("{label}: partial waves and constant EXEC bpermute passed");
+        eprintln!("{label}: partial waves and constant/dynamic EXEC bpermute passed");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+#[test]
+fn wave64_ballot_partial_groups_zero_absent_bits() {
+    let words = [
+        0xBE84_0300, 0xBE85_0380,
+        0xF408_0202, 0xFA00_0000,
+        0x3404_0082, 0xBF8C_C07F,
+        0x7D88_00FF, 1024, // every existing lane is true
+        0x7E06_026A, 0xE070_1000, 0x8002_0302,
+        0x7E06_026B, 0xE070_1200, 0x8002_0302,
+        0xBE90_106A, 0x7E06_0210, 0xE070_1400, 0x8002_0302,
+        0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+        0x7E06_026B, 0xE070_1600, 0x8002_0302,
+        0xBF81_0000,
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        for threads in [1u32, 2, 31, 32, 33, 63, 65, 96, 127, 128] {
+            let shader = build_wave(
+                &words,
+                vec![param(RootType::Table, 0)],
+                vec![entry(ResourceType::Uav, 4, 0)],
+                threads,
+                true,
+            );
+            let c = crate::Container::parse(&shader.dxil).unwrap();
+            let psv = c.part(crate::FourCC::PSV0).unwrap().data;
+            assert_eq!(u32::from_le_bytes(psv[20..24].try_into().unwrap()), 0);
+            assert_eq!(u32::from_le_bytes(psv[24..28].try_into().unwrap()), u32::MAX);
+            let (root, pso) = host.compute_pipeline(&shader).unwrap_or_else(
+                |e| panic!("{label}: compute pipeline failed: {e}"),
+            );
+            let out = host.dispatch(&root, &pso, &Dispatch {
+                roots: vec![(0, Root::Constants(vec![0; shader.user_data_dwords().max(1) as usize]))],
+                views: &[View::RawUav(512)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            }).unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            for i in 0..threads {
+                let n = (threads - (i & !63)).min(64);
+                let mask = u64::MAX >> (64 - n);
+                let want = [mask as u32, (mask >> 32) as u32, n, 0];
+                for (slot, expected) in want.into_iter().enumerate() {
+                    assert_eq!(out[0][slot * 128 + i as usize], expected,
+                        "{label}: ballot slot {slot}, threads={threads}, lane={i}");
+                }
+            }
+        }
+        eprintln!("{label}: partial wave ballots and population count passed");
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
