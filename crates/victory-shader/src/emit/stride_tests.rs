@@ -809,6 +809,15 @@ fn benchmark_wave64_portable_exchange() {
 
 #[test]
 fn wave64_bpermute_partial_groups_and_masked_sources() {
+    check_masked_exchange(false);
+}
+
+#[test]
+fn wave64_bpermute_execz_skips_are_predicated() {
+    check_masked_exchange(true);
+}
+
+fn check_masked_exchange(skip: bool) {
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock().unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
@@ -818,7 +827,10 @@ fn wave64_bpermute_partial_groups_and_masked_sources() {
             continue;
         };
         for threads in [1u32, 31, 33, 63, 65, 96, 127, 128] {
-            for mask_mode in 0..3 {
+            for mask_mode in 0..5 {
+                if skip && mask_mode == 0 {
+                    continue;
+                }
                 let mut words = vec![
                     0xBE84_0300, 0xBE85_0380,
                     0xF408_0202, 0xFA00_0000,
@@ -828,7 +840,12 @@ fn wave64_bpermute_partial_groups_and_masked_sources() {
                 match mask_mode {
                     1 => words.extend([0xBEFE_04FF, 0xAAAA_AAAA]),
                     2 => words.push(0x7DA8_00A8), // v_cmpx_gt_u32 exec, 40, v0
+                    3 => words.push(0x7DA8_0080), // v_cmpx_gt_u32 exec, 0, v0
+                    4 => words.push(0xBEFE_04C1), // full EXEC
                     _ => {}
+                }
+                if skip {
+                    words.push(0xBF88_0003); // skip to EXEC restore
                 }
                 words.extend([
                     0xDACC_0004, 0x0300_0002, // v3 = next lane's v0
@@ -859,6 +876,7 @@ fn wave64_bpermute_partial_groups_and_masked_sources() {
                 let active = |i: u32| match mask_mode {
                     1 => (i & 63) < 32 && i & 1 != 0,
                     2 => i < 40,
+                    3 => false,
                     _ => true,
                 };
                 let first = |i: u32| {
@@ -886,7 +904,7 @@ fn wave64_bpermute_partial_groups_and_masked_sources() {
                 }
             }
         }
-        eprintln!("{label}: partial waves and constant/dynamic EXEC bpermute passed");
+        eprintln!("{label}: partial waves and constant/dynamic EXEC bpermute passed (execz skip={skip})");
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
