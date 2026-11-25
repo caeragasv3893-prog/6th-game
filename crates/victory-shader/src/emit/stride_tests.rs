@@ -1319,15 +1319,23 @@ fn check_integer_prefixes(threads: u32) {
 
 #[test]
 fn wave64_recognized_fp32_inclusive_prefix_preserves_association() {
-    check_fp32_prefix(true);
+    check_fp32_prefix(true, 128);
 }
 
 #[test]
 fn wave64_recognized_fp32_exclusive_prefix_preserves_association() {
-    check_fp32_prefix(false);
+    check_fp32_prefix(false, 128);
 }
 
-fn check_fp32_prefix(inclusive: bool) {
+#[test]
+fn wave64_recognized_fp32_prefix_partial_groups() {
+    for threads in [1, 15, 16, 17, 31, 33, 63, 65, 96, 127] {
+        check_fp32_prefix(true, threads);
+        check_fp32_prefix(false, threads);
+    }
+}
+
+fn check_fp32_prefix(inclusive: bool, threads: u32) {
     use super::wave::{Op, Shape};
     let vop3 = |dst: u32, op: u32, a: u32, b: u32, c: u32| {
         [0xD400_0000 | (op << 16) | dst, a | (b << 9) | (c << 18)]
@@ -1389,7 +1397,7 @@ fn check_fp32_prefix(inclusive: bool) {
         &words,
         vec![param(RootType::Table, 0), param(RootType::Table, 2)],
         vec![entry(ResourceType::Srv, 4, 0), entry(ResourceType::Uav, 4, 2)],
-        128,
+        threads,
         true,
     );
     let c = crate::Container::parse(&shader.dxil).unwrap();
@@ -1448,27 +1456,28 @@ fn check_fp32_prefix(inclusive: bool) {
                 &pso,
                 &Dispatch {
                     roots: vec![(0, Root::Constants(ud.clone()))],
-                    views: &[View::Buffer { data: &bits, stride: Stride::Raw }, View::RawUav(128)],
+                    views: &[View::Buffer { data: &bits, stride: Stride::Raw }, View::RawUav(threads)],
                     samplers: &[],
                     groups: [1, 1, 1],
                 },
             ).unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
-            for base in [0usize, 64] {
+            for base in (0..threads as usize).step_by(64) {
                 let mut expected = reference(&input[base..base + 64]);
                 if !inclusive {
                     expected.rotate_right(1);
                     expected[0] = 0.0;
                 }
-                for (lane, (&bits, want)) in out[0][base..base + 64].iter().zip(expected).enumerate() {
+                let end = (base + 64).min(threads as usize);
+                for (lane, (&bits, want)) in out[0][base..end].iter().zip(expected).enumerate() {
                     if want.is_nan() {
-                        assert!(f32::from_bits(bits).is_nan(), "{label}: case {case}, lane {lane}");
+                        assert!(f32::from_bits(bits).is_nan(), "{label}: case {case}, threads={threads}, lane {}", base + lane);
                     } else {
-                        assert_eq!(bits, want.to_bits(), "{label}: case {case}, lane {lane}");
+                        assert_eq!(bits, want.to_bits(), "{label}: case {case}, threads={threads}, lane {}", base + lane);
                     }
                 }
             }
         }
-        eprintln!("{label}: recognized ordered wave64 FP32 prefix passed (inclusive={inclusive})");
+        eprintln!("{label}: recognized ordered wave64 FP32 prefix passed (inclusive={inclusive}, threads={threads})");
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
