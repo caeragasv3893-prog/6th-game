@@ -645,7 +645,7 @@ The previously validated recognized SUM regression now parameterizes
 all eight integer accumulator operations, including signed/unsigned
 extrema with high-bit input values. Each case verifies recognition,
 unrestricted PSV wave bounds and results from two logical waves.
-Windows validation of these expanded cases is pending.
+The expanded cases passed on both hardware and WARP (see validation below).
 
 The portable recognized-section path now also accepts integer
 `Shape::Prefix(Op::AddU, ...)` with zero identity. Constant EXEC changes
@@ -678,9 +678,13 @@ The new integration regression checks both recognized prefix forms
 on two independent logical waves and validates their DXIL wave bounds.
 An independent host-side model checked 65,536
 inclusive/exclusive lane results over 256 generated 128-thread groups.
-Rust compilation, symbolic recognition and GPU execution of the new
-regressions remain pending. Floating-point scans, arbitrary divergent
-EXEC, general control flow and performance measurements remain open.
+Windows validation at revision `8f3f1ca` passed all eight targeted
+wave64 tests in 2.35 s. Both hardware and WARP explicitly passed all
+eight recognized integer reductions and both inclusive and exclusive
+prefix scans. Strict all-features Clippy passed in 3.12 s. Full
+workspace regression and release validation for this revision remain
+pending. Floating-point scans, arbitrary divergent EXEC, general
+control flow and performance measurements remain open.
 
 ```powershell
 cargo test -p victory-shader --lib --locked wave64_ -- --test-threads=1 --nocapture
