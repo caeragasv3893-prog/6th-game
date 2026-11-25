@@ -631,8 +631,8 @@ fn wave64_bpermute_exchanges_values_across_warps() {
         )
     };
     assert_eq!(wave_bounds(&shader), (0, u32::MAX));
-    // Partial logical waves cannot use the full-wave exchange lowering.
-    assert_eq!(wave_bounds(&make(96)), (64, 64));
+    // Partial logical waves use bounds-safe exchange with absent lanes zero.
+    assert_eq!(wave_bounds(&make(96)), (0, u32::MAX));
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -660,6 +660,88 @@ fn wave64_bpermute_exchanges_values_across_warps() {
             assert_eq!(out[0], want, "{label}");
         }
         eprintln!("{label}: two logical waves, consecutive exchanges passed");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+#[test]
+fn wave64_bpermute_partial_groups_and_masked_sources() {
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        for threads in [1u32, 31, 33, 63, 65, 96, 127, 128] {
+            for masked in [false, true] {
+                let mut words = vec![
+                    0xBE84_0300, 0xBE85_0380,
+                    0xF408_0202, 0xFA00_0000,
+                    0x3404_0082, 0xBF8C_C07F,
+                    0x7E06_0300, // v3 = v0
+                ];
+                if masked {
+                    // Only odd lanes of the low 32 are active.
+                    words.extend([0xBEFE_04FF, 0xAAAA_AAAA]);
+                }
+                words.extend([
+                    0xDACC_0004, 0x0300_0002, // v3 = next lane's v0
+                    0xBF8C_C07F,
+                ]);
+                if masked {
+                    words.push(0xBEFE_04C1); // restore full EXEC
+                }
+                words.extend([
+                    0xE070_1000, 0x8002_0302,
+                    0xDACC_0080, 0x0400_0302, // read across the 32-lane boundary
+                    0xBF8C_C07F,
+                    0xE070_1200, 0x8002_0402,
+                    0xBF81_0000,
+                ]);
+                let shader = build_wave(
+                    &words,
+                    vec![param(RootType::Table, 0)],
+                    vec![entry(ResourceType::Uav, 4, 0)],
+                    threads,
+                    true,
+                );
+                let c = crate::Container::parse(&shader.dxil).unwrap();
+                let psv = c.part(crate::FourCC::PSV0).unwrap().data;
+                assert_eq!(u32::from_le_bytes(psv[20..24].try_into().unwrap()), 0,
+                    "{label}: threads={threads}, masked={masked}");
+                assert_eq!(u32::from_le_bytes(psv[24..28].try_into().unwrap()), u32::MAX);
+                let first = |i: u32| {
+                    let lane = i & 63;
+                    if masked {
+                        if lane < 32 && lane & 1 != 0 { 0 } else { i }
+                    } else {
+                        let src = (i & !63) | ((lane + 1) & 63);
+                        if src < threads { src } else { 0 }
+                    }
+                };
+                let (root, pso) = host.compute_pipeline(&shader).unwrap_or_else(
+                    |e| panic!("{label}: compute pipeline failed: {e}"),
+                );
+                let out = host.dispatch(&root, &pso, &Dispatch {
+                    roots: vec![(0, Root::Constants(vec![0; shader.user_data_dwords().max(1) as usize]))],
+                    views: &[View::RawUav(256)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                }).unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+                for i in 0..threads {
+                    let partner = i ^ 32;
+                    let want = if partner < threads { first(partner) } else { 0 };
+                    assert_eq!(out[0][i as usize], first(i),
+                        "{label}: first exchange, threads={threads}, masked={masked}, lane={i}");
+                    assert_eq!(out[0][128 + i as usize], want,
+                        "{label}: second exchange, threads={threads}, masked={masked}, lane={i}");
+                }
+            }
+        }
+        eprintln!("{label}: partial waves and constant EXEC bpermute passed");
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
