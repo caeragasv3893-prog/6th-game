@@ -595,7 +595,7 @@ pub(crate) fn ordered_sum(
     saved: Value,
     identity: u32,
 ) -> Option<OrderedSum> {
-    ordered_graph(insts, result, source, saved, identity, None)
+    ordered_graph(insts, result, source, saved, identity, None, false)
 }
 
 /// Preserve the actual addition graph for each lane of a prefix.
@@ -607,7 +607,19 @@ pub(crate) fn ordered_prefix(
     identity: u32,
     inclusive: bool,
 ) -> Option<OrderedSum> {
-    ordered_graph(insts, result, source, saved, identity, Some(inclusive))
+    ordered_graph(insts, result, source, saved, identity, Some(inclusive), false)
+}
+
+/// Replay the low halves of a recognized FP16 sum; its high half
+/// is tracked separately by the symbolic Shape::Half analysis.
+pub(crate) fn ordered_half_sum(
+    insts: &[Inst],
+    result: Value,
+    source: Value,
+    saved: Value,
+    identity: u32,
+) -> Option<OrderedSum> {
+    ordered_graph(insts, result, source, saved, identity, None, true)
 }
 
 fn ordered_graph(
@@ -617,6 +629,7 @@ fn ordered_graph(
     saved: Value,
     identity: u32,
     prefix: Option<bool>,
+    half: bool,
 ) -> Option<OrderedSum> {
     if insts.len() > 128 {
         return None;
@@ -652,7 +665,9 @@ fn ordered_graph(
             continue;
         }
         let Fields::Valu(v) = &inst.fields else { return None };
-        if v.abs != 0 || v.neg != 0 || v.clamp || v.omod != 0 || v.sdwa.is_some() {
+        if v.abs != 0 || v.neg != 0 || v.clamp || v.omod != 0 || v.sdwa.is_some()
+            || half && v.opsel != 0
+        {
             return None;
         }
         let read = |op: &Operand| -> Option<Lanes> {
@@ -695,7 +710,8 @@ fn ordered_graph(
             };
             let b = match inst.name() {
                 "v_mov_b32" => None,
-                "v_add_f32" => Some(read(v.src.get(1)?)?),
+                "v_add_f32" if !half => Some(read(v.src.get(1)?)?),
+                "v_add_f16" if half => Some(read(v.src.get(1)?)?),
                 _ => return None,
             };
             let old = inst.read(Reg::V(reg)).and_then(|x| values.get(&x).copied());
@@ -871,6 +887,8 @@ fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
                 ident,
                 lanes,
             } if lanes == all => Some(Shape::Active(op, src, mask, ident)),
+            Sym::Half { op, src, mask, ident, lanes, hi }
+                if lanes == all => Some(Shape::Half(op, src, mask, ident, hi)),
             _ => None,
         };
     }
