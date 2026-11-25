@@ -1847,35 +1847,46 @@ impl<'a> Lower<'a> {
         Ok(if high { y } else { x })
     }
 
-    /// Reference implementation for uniform logical wave64 ballots.
-    /// Each thread publishes its positioned bit; every reader reconstructs
-    /// both words in logical lane order. No physical wave ordering needed.
-    /// Deliberately favors correctness over shared-memory traffic.
+    /// Uniform logical wave64 ballot using two shared atomic OR accumulators.
+    /// Each thread clears its own slot (including both accumulator slots),
+    /// contributes its positioned predicate bit to the appropriate half,
+    /// then reads the two completed words. All threads reach all three
+    /// group barriers; no physical wave ordering or divergent branch needed.
     fn portable_ballot(&mut self, bit: V) -> (V, V) {
+        use super::bitcode::Rmw;
+
         let c = self.cur;
         let flat = self.mesh_thread();
         let mask = self.s.m.i32(!63u32);
         let base = self.s.m.bin(c, Bin::And, flat, mask);
         let low5 = self.s.m.i32(31);
         let shift = self.s.m.bin(c, Bin::And, flat, low5);
+        let k5 = self.s.m.i32(5);
+        let half = self.s.m.bin(c, Bin::LShr, flat, k5);
+        let one = self.s.m.i32(1);
+        let half = self.s.m.bin(c, Bin::And, half, one);
+        let index = self.s.m.bin(c, Bin::Or, base, half);
         let bit = self.s.m.cast(c, Cast::ZExt, bit, self.s.t.i32);
         let word = self.s.m.bin(c, Bin::Shl, bit, shift);
         let lds = self.s.lds();
-        let dst = self.s.m.element(c, lds, flat);
-        self.s.m.store(c, dst, word);
+        let own = self.s.m.element(c, lds, flat);
+        let dst = self.s.m.element(c, lds, index);
+        let hi = self.s.m.bin(c, Bin::Or, base, one);
+        let lo_ptr = self.s.m.element(c, lds, base);
+        let hi_ptr = self.s.m.element(c, lds, hi);
+        let zero = self.s.m.i32(0);
         let mode = self.s.m.i32(1 | 8);
+
+        // No two threads clear the same slot. Wait before accumulating.
+        self.s.m.store(c, own, zero);
         self.s.op(c, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[mode]);
-        let mut words = [self.s.m.i32(0); 2];
-        for lane in 0..64u32 {
-            let k = self.s.m.i32(lane);
-            let index = self.s.m.bin(c, Bin::Or, base, k);
-            let ptr = self.s.m.element(c, lds, index);
-            let x = self.s.m.load(c, ptr);
-            let half = &mut words[(lane / 32) as usize];
-            *half = self.s.m.bin(c, Bin::Or, *half, x);
-        }
+        self.s.m.atomic(c, Rmw::Or, dst, word);
         self.s.op(c, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[mode]);
-        (words[0], words[1])
+        let lo = self.s.m.load(c, lo_ptr);
+        let hi = self.s.m.load(c, hi_ptr);
+        // A later ballot or bpermute must not overwrite a pending read.
+        self.s.op(c, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[mode]);
+        (lo, hi)
     }
 
     /// Both dwords of a mask holding lanes that do not reach the block
