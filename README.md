@@ -967,10 +967,23 @@ incurs most of the measured latency; these data do not establish
 GPU execution cost or gameplay performance. Revision `2b37360`
 adds optional D3D12 timestamp queries immediately before and after
 Dispatch and reports GPU-clock median/p95 alongside end-to-end timing.
-The timestamp path awaits Windows compilation and execution.
+Windows validation at `f78bad7` passed strict all-features Clippy
+(3.94 s) and the timestamp benchmark (3.57 s). GPU-clock median
+at 0/1/8/32/64 exchanges was 1.856/1.856/1.856/2.448/7.616 us
+on hardware and 4.500/5.800/6.900/11.150/17.800 us on WARP.
+The hardware 64-exchange p95 was 8.032 us. These synthetic results
+separate dispatch execution from host setup but do not establish
+performance under real title workloads.
 Ordinary untimed correctness dispatches do not allocate queries.
-Arbitrary divergent control flow and partial-wave floating-point
-recognition remain open; no title data or AMD validation is claimed.
+
+Revision `3e7f114` extends proven ordered FP32 inclusive/exclusive
+prefix graphs to incomplete groups. Each live root depends only on
+existing earlier lanes; unused roots receive defined placeholder
+inputs via in-bounds scratch reads. Regression cases exercise ten
+partial sizes, three floating-point input sets and both prefix modes.
+Windows validation is pending. Whole-wave FP32/FP16 reductions on
+partial groups and arbitrary divergent control flow remain open;
+no title data or AMD validation is claimed.
 
 ### Development roadmap
 
