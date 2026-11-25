@@ -83,6 +83,39 @@ Raw companion descriptors consume additional heap slots; their lifetime,
 capacity, and behaviour during real workloads need validation. The new
 companion path covers SRV reads, not all UAV writes or typed buffer accesses.
 
+### Phase 2 — graphics runtime hardening (implementation in review)
+
+The original 5/5 milestone refers to the previously tested revision, not
+the new commits below. Phase 2 has not yet passed a Windows regression run.
+
+| Work item | Implementation | Validation |
+|-----------|----------------|------------|
+| Portable heap capacity and reserved null slots | Fixed shader ABI; actual host allocation must succeed at the required capacity | Layout arithmetic checked in 1,000,004 model cases; Rust tests pending |
+| Descriptor allocation and companion reuse | Share each reserved pair between two raw SRVs; retain stable indices across rewrites | Stress and companion tests added; pending Windows run |
+| Invalid raw buffer accesses | Check resource kind, write permission, alignment, size and overflow; use null views on invalid ranges | Boundary tests added; pending Windows run |
+| Shader descriptor metadata | Explicitly initialize stride/mark/address tables; clamp address indices and include full properties in handle cache key | Pending full shader regression run |
+| Synthetic benchmarks | Descriptor allocation/release benchmark (100,000 cycles) | Not measured yet |
+| Continuous integration | Windows branch push checks, both Clippy configurations, workspace tests and release build | Workflow configured; no successful run confirmed |
+| Full title-to-host descriptor remapping | Not implemented | Pending design and workloads |
+| VRAM profiling, additional shader coverage and performance | Not implemented | Pending measured baseline |
+
+The fixed portable ABI is still 1,000,000 resource descriptors; it does not
+expose all descriptors from a larger title heap. Oversized heaps are capped
+with a warning, not fully remapped. Unaligned raw companion offsets use a
+null view rather than risk invalid D3D12 descriptors; preserving those
+reads requires an aligned copy or explicit shader offset handling. Companion
+slots remain reserved for the lifetime of the heap to avoid premature reuse.
+
+Run the new checks and benchmark without game data:
+
+```powershell
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --locked -- --test-threads=1
+cargo build --release -p victory --locked
+cargo test -p victory-gpu --release --locked benchmark_dynamic_descriptor_churn -- --ignored --nocapture
+```
+
 ### Development roadmap
 
 - [x] Build the project on the NVIDIA test machine.
