@@ -3031,15 +3031,22 @@ impl<'a> Lower<'a> {
 
     /// This lane's bit of the mask `lo`, `hi` (wave64).
     fn lane_bit(&mut self, at: usize, lo: V, hi: Option<V>) -> V {
-        self.s.flags |= flags::WAVE_OPS;
-        let lane = self.s.op(
-            at,
-            "waveGetLaneIndex",
-            Attr::ReadOnly,
-            self.s.t.i32,
-            111,
-            &[],
-        );
+        // A console mask addresses logical lanes, not the host warp.
+        // In the portable path the lane index is defined in the entry
+        // block, so it also dominates uses of masks at other positions.
+        let lane = if self.portable_lanes {
+            self.lane_index()
+        } else {
+            self.s.flags |= flags::WAVE_OPS;
+            self.s.op(
+                at,
+                "waveGetLaneIndex",
+                Attr::ReadOnly,
+                self.s.t.i32,
+                111,
+                &[],
+            )
+        };
         let (k31, k32, one, z) = (
             self.s.m.i32(31),
             self.s.m.i32(32),
