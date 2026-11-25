@@ -85,17 +85,20 @@ companion path covers SRV reads, not all UAV writes or typed buffer accesses.
 
 ### Phase 2 — graphics runtime hardening (implementation in review)
 
-The original 5/5 milestone refers to the previously tested revision, not
-the new commits below. Phase 2 has not yet passed a Windows regression run.
+**Phase 2 regression run: 705 passed, 0 failed, 11 ignored.** Windows release
+build succeeded in 17.71 s. These results apply to commit `3856c93`, before
+the subsequent Clippy-only type alias change. The nested HLE child test is
+not counted twice. Both Clippy runs stopped on the same type-complexity
+lint; a named handle-cache key has been committed and awaits revalidation.
 
 | Work item | Implementation | Validation |
 |-----------|----------------|------------|
-| Portable heap capacity and reserved null slots | Fixed shader ABI; actual host allocation must succeed at the required capacity | Layout arithmetic checked in 1,000,004 model cases; Rust tests pending |
-| Descriptor allocation and companion reuse | Share each reserved pair between two raw SRVs; retain stable indices across rewrites | Stress and companion tests added; pending Windows run |
-| Invalid raw buffer accesses | Check resource kind, write permission, alignment, size and overflow; use null views on invalid ranges | Boundary tests added; pending Windows run |
-| Shader descriptor metadata | Explicitly initialize stride/mark/address tables; clamp address indices and include full properties in handle cache key | Pending full shader regression run |
+| Portable heap capacity and reserved null slots | Fixed shader ABI; actual host allocation must succeed at the required capacity | Layout arithmetic checked in 1,000,004 model cases; Rust boundary test passed |
+| Descriptor allocation and companion reuse | Share each reserved pair between two raw SRVs; retain stable indices across rewrites | Stress and companion tests passed on Windows |
+| Invalid raw buffer accesses | Check resource kind, write permission, alignment, size and overflow; use null views on invalid ranges | Boundary tests passed on Windows |
+| Shader descriptor metadata | Explicitly initialize stride/mark/address tables; clamp address indices and include full properties in handle cache key | 248 shader tests passed; 3 ignored |
 | Synthetic benchmarks | Descriptor allocation/release benchmark (100,000 cycles) | Not measured yet |
-| Continuous integration | Windows branch push checks, both Clippy configurations, workspace tests and release build | Workflow configured; no successful run confirmed |
+| Continuous integration | Windows branch push checks, both Clippy configurations, workspace tests and release build | Workflow configured; no successful CI run confirmed. Local Clippy recheck pending |
 | Full title-to-host descriptor remapping | Not implemented | Pending design and workloads |
 | VRAM profiling, additional shader coverage and performance | Not implemented | Pending measured baseline |
 
