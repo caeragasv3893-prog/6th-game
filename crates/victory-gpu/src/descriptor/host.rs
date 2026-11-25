@@ -475,7 +475,7 @@ impl HostHeap {
     /// structured original for shaders that use it as structured.
     fn raw_srv_alias(&self, index: u32, buffer: &ID3D12Resource, first: u64, bytes: u64) -> u32 {
         let null = victory_shader::emit::NULL_BUFFER_VIEW;
-        if !first.is_multiple_of(4) || bytes == 0 || !bytes.is_multiple_of(4) {
+        if !first.is_multiple_of(16) || bytes == 0 || !bytes.is_multiple_of(4) {
             self.clear_raw_srv_alias(index);
             return null;
         }
@@ -956,7 +956,7 @@ fn in_buffer(buffer: &ID3D12Resource, first: u64, count: u32, element: u64) -> b
 
 fn raw_range_valid(width: u64, first: u64, bytes: u64) -> bool {
     bytes != 0
-        && first.is_multiple_of(4)
+        && first.is_multiple_of(16)
         && bytes.is_multiple_of(4)
         && first.checked_add(bytes).is_some_and(|end| end <= width)
 }
@@ -1465,7 +1465,8 @@ mod tests {
     #[test]
     fn raw_ranges_reject_overflow_and_invalid_alignment() {
         assert!(raw_range_valid(64, 0, 64));
-        assert!(raw_range_valid(64, 60, 4));
+        assert!(raw_range_valid(64, 48, 16));
+        assert!(!raw_range_valid(64, 60, 4));
         assert!(!raw_range_valid(64, 64, 4));
         assert!(!raw_range_valid(64, 0, 0));
         assert!(!raw_range_valid(64, 2, 4));
@@ -1481,9 +1482,10 @@ mod tests {
         let first = heap.raw_srv_alias(0, &buffer, 0, 64);
         let second = heap.raw_srv_alias(1, &buffer, 0, 64);
         assert_eq!(second, first + 1);
-        assert_eq!(heap.raw_srv_alias(0, &buffer, 4, 60), first);
+        assert_eq!(heap.raw_srv_alias(0, &buffer, 16, 48), first);
         heap.clear_raw_srv_alias(0);
         assert_eq!(heap.raw_srv_alias(0, &buffer, 0, 64), first);
+        // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 
