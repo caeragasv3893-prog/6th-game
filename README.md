@@ -847,11 +847,25 @@ The uniform explicit bpermute path now admits lane-local FP16
 add/min/max without DPP, using the existing half-precision arithmetic
 lowering and destination-half preservation. The new regression checks
 two logical waves, intermediate half rounding and preservation of each
-lane's original high half. These additions require Windows compilation,
-strict Clippy, DXIL and GPU validation. Automatic whole-wave FP16
-recognition, general divergent EXEC, arbitrary DPP and performance
-optimization remain open; no unsupported cases have been silently
-enabled.
+lane's original high half. Windows validation of the preceding batch
+passed all fourteen targeted wave64 tests in 3.83 s, including both
+new regressions on hardware and WARP. Strict Clippy passed in 3.09 s,
+all executed workspace tests passed (262 shader tests, three ignored),
+and the release build succeeded in 17.45 s.
+
+### Uniform explicit DPP on logical wave64 (2026-11-25)
+
+The straight-line portable compute path now supports the existing
+decoded DPP row and DPP8 patterns on its admitted lane-local
+instructions. It shares the bpermute scratch reader, preserving
+logical lane numbering and keeping both group barriers uniform.
+Out-of-row indices are replaced with the current lane before loading;
+the original DPP zero-fill and row/bank write masks still apply.
+The regression covers row shifts, zero-fill, masked row mirror and
+row rotation on two logical waves. Compilation, strict Clippy and
+GPU validation are pending. Unsupported DPP controls, general divergent
+EXEC, automatic whole-wave FP16 and performance optimization remain
+open.
 
 ### Development roadmap
 
