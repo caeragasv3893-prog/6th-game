@@ -535,21 +535,25 @@ impl<'a> Lower<'a> {
             };
             let wave = if x.native.wave64 { 64 } else { 32 };
             let one_wave = cs.threads.iter().product::<u32>() <= wave;
-            // A narrow portable subset: literal MBCNT and unmasked
-            // bpermute in straight-line compute code. For bpermute,
+            // A narrow portable subset: literal MBCNT, unmasked bpermute
+            // and ballots of unmasked integer compares. Scratch operations
             // require complete logical waves and no title LDS or guards:
             // every thread must reach both group barriers.
-            let exchange = insts().any(|i| i.name() == "ds_bpermute_b32");
+            let scratch = insts().any(|i| {
+                i.name() == "ds_bpermute_b32" || reads_mask_as_data(x.st, i)
+            });
             let threads = cs.threads.iter().product::<u32>();
             portable_lanes = x.native.wave64
-                && (!exchange || (64..=1024).contains(&threads)
+                && (!scratch || (64..=1024).contains(&threads)
                     && threads.is_multiple_of(64)
                     && x.st.guards.iter().flatten().all(|g| g.is_none() || *g == Some(Bool::TRUE)))
                 && console_lanes
                 && s.lds_dwords == 0
                 && p.blocks.len() == 1
                 && insts().all(|i| {
-                    if reads_mask_as_data(x.st, i) {
+                    if reads_mask_as_data(x.st, i)
+                        && !matches!(i.name(), "v_mov_b32" | "s_bcnt1_i32_b64")
+                    {
                         return false;
                     }
                     match i.name() {
@@ -558,18 +562,22 @@ impl<'a> Lower<'a> {
                                 if v.dpp.is_none()
                                 && matches!(v.src.first(), Some(Operand::Const(193))))
                         }
-                        "s_mov_b32" | "s_load_dwordx4" => i.writes.iter().all(
+                        "s_mov_b32" | "s_load_dwordx4" | "s_bcnt1_i32_b64" => i.writes.iter().all(
                             |&(r, _)| matches!(r, Reg::S(0..=103)),
                         ),
                         "v_mov_b32" | "v_lshlrev_b32" => {
                             matches!(&i.fields, Fields::Valu(v) if v.dpp.is_none())
+                        }
+                        "v_cmp_gt_u32" | "v_cmp_eq_u32" => {
+                            matches!(&i.fields, Fields::Valu(v) if v.dpp.is_none())
+                                && i.writes.iter().all(|&(r, _)| matches!(r, Reg::S(106..=107)))
                         }
                         "ds_bpermute_b32" => matches!(&i.fields, Fields::Ds { gds: false, .. }),
                         "s_waitcnt" | "s_endpgm" | "buffer_store_dword" => true,
                         _ => false,
                     }
                 });
-            if portable_lanes && exchange {
+            if portable_lanes && scratch {
                 // The entire group's scratch is private to this lowering.
                 // Reuse it only after all readers have reached the second barrier.
                 s.lds_dwords = threads;
@@ -1814,18 +1822,57 @@ impl<'a> Lower<'a> {
                 let bit = self.boolean(m, at);
                 self.balloting.remove(&lo);
                 let bit = bit?;
-                let i32t = self.s.t.i32;
-                let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
-                let r = self
-                    .s
-                    .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
-                self.s.flags |= flags::WAVE_OPS;
-                let xy = (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1));
+                let xy = if self.portable_lanes {
+                    // Only uniform, complete logical waves with private scratch.
+                    if at != self.cur || self.s.lds_dwords == 0 {
+                        return Err("a portable ballot outside uniform scratch code");
+                    }
+                    self.portable_ballot(bit)
+                } else {
+                    let i32t = self.s.t.i32;
+                    let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+                    let r = self
+                        .s
+                        .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
+                    self.s.flags |= flags::WAVE_OPS;
+                    (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1))
+                };
                 self.ballots.insert(lo, xy);
                 xy
             }
         };
         Ok(if high { y } else { x })
+    }
+
+    /// Reference implementation for uniform logical wave64 ballots.
+    /// Each thread publishes its positioned bit; every reader reconstructs
+    /// both words in logical lane order. No physical wave ordering needed.
+    /// Deliberately favors correctness over shared-memory traffic.
+    fn portable_ballot(&mut self, bit: V) -> (V, V) {
+        let c = self.cur;
+        let flat = self.mesh_thread();
+        let mask = self.s.m.i32(!63u32);
+        let base = self.s.m.bin(c, Bin::And, flat, mask);
+        let low5 = self.s.m.i32(31);
+        let shift = self.s.m.bin(c, Bin::And, flat, low5);
+        let bit = self.s.m.cast(c, Cast::ZExt, bit, self.s.t.i32);
+        let word = self.s.m.bin(c, Bin::Shl, bit, shift);
+        let lds = self.s.lds();
+        let dst = self.s.m.element(c, lds, flat);
+        self.s.m.store(c, dst, word);
+        let mode = self.s.m.i32(1 | 8);
+        self.s.op(c, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[mode]);
+        let mut words = [self.s.m.i32(0); 2];
+        for lane in 0..64u32 {
+            let k = self.s.m.i32(lane);
+            let index = self.s.m.bin(c, Bin::Or, base, k);
+            let ptr = self.s.m.element(c, lds, index);
+            let x = self.s.m.load(c, ptr);
+            let half = &mut words[(lane / 32) as usize];
+            *half = self.s.m.bin(c, Bin::Or, *half, x);
+        }
+        self.s.op(c, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[mode]);
+        (words[0], words[1])
     }
 
     /// Both dwords of a mask holding lanes that do not reach the block
