@@ -728,6 +728,37 @@ cargo test -p victory-shader --lib --locked wave64_ -- --test-threads=1 --nocapt
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 ```
 
+### Recognized FP32 wave64 extrema (2026-11-25)
+
+The automatic whole-wave reduction path now admits recognized FP32
+MIN and MAX in the existing uniform compute subset. Instead of
+integer atomics, it combines the values in six shared-memory butterfly
+rounds using the existing FP32 min/max helper, including signed-zero
+ordering and flush-to-zero handling. The eligibility check excludes
+immediate extrema operands and immediate moves within FP32 sections:
+an infinity used as an arithmetic operand is not an identity for NaN.
+
+The regression constructs native row reductions, verifies symbolic
+recognition and unrestricted DXIL wave bounds, then tests finite
+values, infinities, quiet NaNs, all-NaN waves, signed zeros and
+subnormal inputs. It compares 1,024 output words per available
+adapter against a CPU reference (NaN payloads are not compared).
+A separate arithmetic model checked 32,768 lane
+results for numeric extrema and quiet NaN classification.
+
+FP32 addition is deliberately not admitted to this automatic path:
+the current symbolic representation records the contributing lanes,
+not the original association tree, and reassociating sums can change
+rounding. Explicit FP32 addition remains supported as validated above.
+General signaling-NaN behavior, FP16, arbitrary divergent EXEC and
+performance remain unvalidated. Rust compilation, DXIL validation and
+hardware/WARP execution of this extension are pending.
+
+```powershell
+cargo test -p victory-shader --lib --locked wave64_ -- --test-threads=1 --nocapture
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+```
+
 ### Development roadmap
 
 - [x] Build the project on the NVIDIA test machine.
