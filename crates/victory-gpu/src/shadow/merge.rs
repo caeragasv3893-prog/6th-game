@@ -100,6 +100,53 @@ mod tests {
         }
     }
 
+    /// Compare the same memory merge, excluding input reset time. No D3D12
+    /// calls or game data are required.
+    #[test]
+    #[ignore = "benchmark: compare scalar and SIMD memory merge"]
+    fn benchmark_runtime_memory_merge() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        for len in [64usize << 10, 8usize << 20] {
+            let before: Vec<u8> = (0..len).map(|i| i as u8).collect();
+            let mut original_title = before.clone();
+            let mut original_host = before.clone();
+            for i in (0..len).step_by(37) {
+                original_title[i] ^= 0x55;
+            }
+            for i in (0..len).step_by(53) {
+                original_host[i] ^= 0xaa;
+            }
+            let mut title = original_title.clone();
+            let mut host = original_host.clone();
+            let mut timings = [Vec::new(), Vec::new()];
+            let paths = [
+                merge_scalar as fn(&mut [u8], &mut [u8], &[u8]) -> bool,
+                merge,
+            ];
+            // Alternate which path runs first to reduce ordering bias.
+            for round in 0..20 {
+                for index in [round % 2, 1 - round % 2] {
+                    title.copy_from_slice(&original_title);
+                    host.copy_from_slice(&original_host);
+                    let start = Instant::now();
+                    let changed = paths[index](black_box(&mut title), black_box(&mut host), black_box(&before));
+                    let elapsed = start.elapsed();
+                    assert!(black_box(changed));
+                    assert_eq!(title, host);
+                    timings[index].push(elapsed.as_secs_f64() * 1000.0);
+                }
+            }
+            for samples in &mut timings {
+                samples.sort_by(f64::total_cmp);
+            }
+            let median = |samples: &[f64]| (samples[9] + samples[10]) * 0.5;
+            eprintln!("{len} bytes: scalar {:.6} ms, selected {:.6} ms",
+                median(&timings[0]), median(&timings[1]));
+        }
+    }
+
     #[test]
     fn runtime_merge_preserves_cpu_only_bytes_and_gpu_conflict_policy() {
         let before = [1, 2, 3, 4, 5];
