@@ -705,7 +705,7 @@ fn wave64_exchange_barrier_budget() {
                 true,
             );
             let emitted = if threads.is_multiple_of(64) {
-                u32::from(exchanges % 64 != 0)
+                u32::from(!exchanges.is_multiple_of(64))
             } else {
                 exchanges
             };
@@ -716,8 +716,8 @@ fn wave64_exchange_barrier_budget() {
     }
 }
 
-/// The composed source must be correct for arbitrary data; an observed
-/// intermediate or an intervening ALU operation must prevent fusion.
+/// Check the composed source, identity and observable intermediate on
+/// complete and incomplete logical waves.
 #[test]
 fn wave64_exchange_fusion_guards_and_identity() {
     let _one = super::valu_tests::ONE_AT_A_TIME
@@ -755,7 +755,7 @@ fn wave64_exchange_fusion_guards_and_identity() {
                 let emitted = if observe || !threads.is_multiple_of(64) {
                     2
                 } else {
-                    u32::from((first + second) % 64 != 0)
+                    u32::from(!(first + second).is_multiple_of(64))
                 };
                 assert_eq!(barriers, emitted as usize, "{label}: {threads}, {first}, {second}, {observe}");
                 assert_eq!(scratch, threads * emitted);
@@ -921,6 +921,18 @@ fn wave64_bpermute_group_uniform_branch_and_loop() {
 #[test]
 #[ignore = "benchmark: release dispatch/readback timing"]
 fn benchmark_wave64_portable_exchange() {
+    benchmark_exchange(false);
+}
+
+/// An ALU instruction between exchanges prevents the rotation-chain pass
+/// from collapsing the workload. This measures the LDS path separately.
+#[test]
+#[ignore = "benchmark: non-fusible exchange timing"]
+fn benchmark_wave64_portable_exchange_interleaved() {
+    benchmark_exchange(true);
+}
+
+fn benchmark_exchange(interleaved: bool) {
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock().unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
@@ -931,7 +943,7 @@ fn benchmark_wave64_portable_exchange() {
         };
         let mut baseline = 0.0;
         let mut gpu_baseline = 0.0;
-        for exchanges in [0u32, 1, 8, 32, 64] {
+        for exchanges in [0u32, 1, 8, 32, 63, 64] {
             let mut words = vec![
                 0xBE84_0300, 0xBE85_0380,
                 0xF408_0202, 0xFA00_0000,
@@ -940,6 +952,9 @@ fn benchmark_wave64_portable_exchange() {
             ];
             for _ in 0..exchanges {
                 words.extend([0xDACC_0004, 0x0300_0302, 0xBF8C_C07F]);
+                if interleaved {
+                    words.push(0x4A06_0681); // v3 = v3 + 1
+                }
             }
             words.extend([0xE070_1000, 0x8002_0302, 0xBF81_0000]);
             let (shader, barriers, scratch) = build_wave_with_metrics(
@@ -949,7 +964,13 @@ fn benchmark_wave64_portable_exchange() {
                 128,
                 true,
             );
-            eprintln!("{label}: {exchanges} source exchanges -> {barriers} emitted barriers, {scratch} scratch dwords");
+            let expected_barriers = if interleaved {
+                exchanges
+            } else {
+                u32::from(!exchanges.is_multiple_of(64))
+            };
+            assert_eq!(barriers, expected_barriers as usize);
+            eprintln!("{label}: interleaved={interleaved}, {exchanges} source exchanges -> {barriers} emitted barriers, {scratch} scratch dwords");
             let (root, pso) = host.compute_pipeline(&shader).unwrap_or_else(
                 |e| panic!("{label}: compute pipeline failed: {e}"),
             );
@@ -960,7 +981,7 @@ fn benchmark_wave64_portable_exchange() {
                 groups: [1, 1, 1],
             };
             let want: Vec<u32> = (0..128u32)
-                .map(|i| (i & !63) | ((i + exchanges) & 63))
+                .map(|i| ((i & !63) | ((i + exchanges) & 63)) + if interleaved { exchanges } else { 0 })
                 .collect();
             for _ in 0..3 {
                 let out = host.dispatch(&root, &pso, &dispatch).unwrap();
