@@ -12,39 +12,62 @@
 //! descriptor heaps, [`root`] root signatures, [`query`] query heaps,
 //! [`signature`] command signatures, [`pipeline`] pipeline states,
 //! [`frame`] frame pacing, [`object`] what all console graphics objects
-//! share, [`console`] which console model the title sees, `external` host
-//! libraries recording into title lists. Planned:
+//! share, [`console`] which console model the title sees. Planned:
 //! `present` (swap chain).
 
-#[cfg(windows)]
-mod bindless;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod backreads;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
+#[cfg(windows)]
+mod cardmeter;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod renderdoc;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod shot;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
+mod drvwatch;
+#[cfg(windows)]
+mod fpsbox;
+#[cfg(windows)]
+mod stats;
+#[cfg(windows)]
+mod spread;
+#[cfg(windows)]
 mod draw;
 pub mod dxgi;
-#[cfg(windows)]
-pub mod external;
 pub mod fence;
 pub mod frame;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod heap_pass;
+#[cfg(windows)]
+pub mod framelog;
+#[cfg(windows)]
+mod heap_worker;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
 mod indirect;
-pub mod list;
 #[cfg(windows)]
-mod memory;
+mod inplace;
+pub mod list;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
+mod plaincopy;
+#[cfg(windows)]
 mod primitive;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod profile;
 pub mod query;
 pub mod queue;
+#[cfg(windows)]
+mod queue2;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
@@ -52,22 +75,25 @@ mod sampler;
 #[cfg(windows)]
 pub mod shader_cache;
 #[cfg(windows)]
-mod shadow;
-pub mod signature;
-mod switch;
+mod memory;
 #[cfg(windows)]
-mod tdr;
+mod shadow;
+#[cfg(windows)]
+mod tiles;
+pub mod signature;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]
-mod twin;
-#[cfg(windows)]
 mod watch;
+#[cfg(windows)]
+mod texback;
 
 #[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]
+pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
+#[cfg(windows)]
 pub use watch::{
-    Writing as KernelWrite, title_memory_aliased, title_memory_remapped,
+    title_memory_committed, title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_written,
     writing as kernel_will_write,
 };

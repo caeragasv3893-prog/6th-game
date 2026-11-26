@@ -112,32 +112,6 @@ impl Title {
     }
 }
 
-/// The trimmed text of one element: comments inside it are skipped, not
-/// treated as the end of its value. A manifest generator can write
-/// `<TitleId><!-- generated -->639AA8DD</TitleId>`, which must still give
-/// the title's id rather than an empty field.
-fn field_text(rest: &str) -> String {
-    let mut out = String::new();
-    let mut rest = rest;
-    loop {
-        let Some(open) = rest.find('<') else {
-            out.push_str(rest);
-            break;
-        };
-        out.push_str(&rest[..open]);
-        if rest[open..].starts_with("<!--") {
-            let Some(end) = rest[open..].find("-->") else {
-                break;
-            };
-            rest = &rest[open + end + 3..];
-        } else {
-            // A child element, a closing tag or anything else ends the text.
-            break;
-        }
-    }
-    out.trim().to_owned()
-}
-
 /// Each element of an XML text as its path from the root (`Game/TitleId`)
 /// and its trimmed text up to the first child, the predefined entities
 /// decoded; comments, CDATA sections, declarations and attributes are
@@ -153,7 +127,7 @@ fn elements(text: &str) -> Vec<(String, String)> {
         } else if rest.starts_with("<![CDATA[") {
             rest.find("]]>").map(|e| e + 3)
         } else {
-            tag_end(rest)
+            rest.find('>').map(|e| e + 1)
         };
         let Some(end) = end else { break };
         let tag = &rest[1..end - 1];
@@ -174,31 +148,16 @@ fn elements(text: &str) -> Vec<(String, String)> {
             .next()
             .unwrap_or("");
         path.push(name);
-        let body = field_text(rest);
+        let body = rest[..rest.find('<').unwrap_or(rest.len())].trim();
         let body = [("&lt;", "<"), ("&gt;", ">"), ("&quot;", "\""), ("&apos;", "'"), ("&amp;", "&")]
             .iter()
-            .fold(body, |b, (entity, c)| b.replace(entity, c));
+            .fold(body.to_owned(), |b, (entity, c)| b.replace(entity, c));
         out.push((path.join("/"), body));
         if closed {
             path.pop();
         }
     }
     out
-}
-
-/// Where the tag that starts `text` ends, past its `>`; a `>` in a quoted
-/// attribute value is part of the value (XML allows it there unescaped).
-fn tag_end(text: &str) -> Option<usize> {
-    let mut quote = None;
-    for (at, c) in text.char_indices() {
-        match (quote, c) {
-            (None, '"' | '\'') => quote = Some(c),
-            (Some(open), _) if c == open => quote = None,
-            (None, '>') => return Some(at + 1),
-            _ => {}
-        }
-    }
-    None
 }
 
 static TITLE: Mutex<Option<Title>> = Mutex::new(None);
@@ -217,7 +176,7 @@ pub fn title() -> Title {
 }
 
 /// Gives the process the console's millisecond timers. Titles pace
-/// themselves with short waits (Grand Theft Auto VI's audio mixer sleeps
+/// themselves with short waits (the title's audio mixer sleeps
 /// about 4 ms per 5.3 ms block) and cannot tune the timer on the console;
 /// a desktop process waits in 15.6 ms ticks unless it asks for finer ones,
 /// and Windows 11 drops that request while the window is hidden unless the
@@ -226,13 +185,23 @@ pub fn title() -> Title {
 pub fn use_console_timers() {
     use windows_sys::Win32::Media::timeBeginPeriod;
     use windows_sys::Win32::System::Threading::{
-        GetCurrentProcess, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        GetCurrentProcess, PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
         PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_POWER_THROTTLING_STATE,
         ProcessPowerThrottling, SetProcessInformation,
     };
+    // Also: the system does not run this process at reduced speed (its
+    // "efficiency mode": lower clock, the slow cores of a hybrid processor)
+    // when its window is not the one in front, as while its owner works in
+    // another window or streams. The console has eight cores alike and no
+    // such mode. `VICTORY_EFFICIENCY_MODE=1` leaves the system its choice.
+    let execution = if std::env::var_os("VICTORY_EFFICIENCY_MODE").is_some_and(|v| v == "1") {
+        0
+    } else {
+        PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+    };
     let keep = PROCESS_POWER_THROTTLING_STATE {
         Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
-        ControlMask: PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+        ControlMask: PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION | execution,
         StateMask: 0,
     };
     // SAFETY: plain process settings; `keep` outlives the call.
@@ -252,15 +221,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_quoted_angle_bracket_does_not_end_its_tag() {
-        let text = "<Game><ShellVisuals DefaultDisplayName=\"A > B\" Description='x>y'/>\
-                    <TitleId>639AA8DD</TitleId>\
-                    <PersistentLocalStorage><SizeMB>64</SizeMB></PersistentLocalStorage></Game>";
-        let t = Title::from_manifest(text);
-        assert_eq!((t.id, t.storage_bytes), (0x639A_A8DD, 64 << 20));
-    }
-
-    #[test]
     fn reads_title_id_store_id_and_storage_quota() {
         let text = "\u{feff}<?xml version=\"1.0\"?>\n<Game configVersion=\"1\">\
                     <!-- <TitleId>00000000</TitleId> -->\
@@ -272,18 +232,5 @@ mod tests {
         assert_eq!((t.id, t.storage_bytes), (0x639A_A8DD, 1024 << 20));
         assert_eq!(t.store_id, "9&C");
         assert_eq!(Title::from_manifest("").storage_bytes, 0);
-    }
-
-    #[test]
-    fn inline_comments_do_not_truncate_a_field() {
-        let text = "<Game>\
-            <TitleId><!-- generated -->639AA8DD</TitleId>\
-            <StoreId>9&amp;<!-- keep -->C</StoreId>\
-            <PersistentLocalStorage><SizeMB><!-- n -->1024</SizeMB></PersistentLocalStorage>\
-            </Game>";
-        let t = Title::from_manifest(text);
-        assert_eq!(t.id, 0x639A_A8DD);
-        assert_eq!(t.store_id, "9&C");
-        assert_eq!(t.storage_bytes, 1024 << 20);
     }
 }

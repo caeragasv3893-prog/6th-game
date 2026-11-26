@@ -5,7 +5,6 @@
 
 mod census;
 mod inspect;
-mod prebuild;
 mod run;
 mod shader;
 mod translate;
@@ -58,21 +57,15 @@ enum Command {
         list: bool,
     },
     /// Find shader containers in files or directories (also inside engine
-    /// archives, if uncompressed) and report their layout. Shader packs
-    /// among the paths are listed last, their stages named from the
-    /// containers found.
+    /// archives, if uncompressed) and report their layout.
     ShaderInfo {
         paths: Vec<PathBuf>,
-        /// Print one line per container found (and per pack pipeline).
+        /// Print one line per container found.
         #[arg(long)]
         verbose: bool,
         /// Also list the decoded native instructions (implies --verbose).
         #[arg(long)]
         disasm: bool,
-        /// Instead list the effects of shader databases: technique, pass,
-        /// shaders (name, container hash, engine hash) and pass state.
-        #[arg(long)]
-        effects: bool,
     },
     /// Run every shader found (containers, SGD5 files) through the
     /// translator and report what it cannot handle yet.
@@ -82,10 +75,7 @@ enum Command {
         /// else the newest Windows SDK's).
         #[arg(long)]
         validate: bool,
-        /// Also create a host D3D12 pipeline for each emitted shader. With
-        /// `--cache`: then make every pipeline of the title's shader pack
-        /// into the host pipeline library `run` reads (on this GPU and
-        /// driver; a second time only what is not there yet).
+        /// Also create a host D3D12 pipeline for each emitted shader.
         #[arg(long)]
         pipelines: bool,
         /// Print one line per program and outcome.
@@ -94,11 +84,13 @@ enum Command {
         /// Worker threads (default: every logical core).
         #[arg(long)]
         jobs: Option<usize>,
-        /// Only translate into the shader cache `run` reads (the warm-up):
-        /// every container found, once, nothing else checked or listed
-        /// (with `--pipelines`, then the shader pack's pipelines).
-        #[arg(long, conflicts_with_all = ["validate", "list"])]
-        cache: bool,
+        /// Warm the run's shader cache: a file of shader hashes (the 16
+        /// hex digits a run's log names a shader by, anywhere in a line);
+        /// the containers with those hashes are translated into the
+        /// cache and nothing else is done. Set `VICTORY_HOST_WAVE` and
+        /// `VICTORY_VIEW_LIMIT` to what the run's log says of the host.
+        #[arg(long)]
+        warm: Option<PathBuf>,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -160,23 +152,28 @@ fn main() -> Result<()> {
             paths,
             verbose,
             disasm,
-            effects,
-        } => shader::run(paths, verbose || disasm, disasm, effects),
-        Command::Translate {
-            paths,
-            jobs,
-            pipelines,
-            cache: true,
-            ..
-        } => translate::warm(paths, jobs, pipelines),
+        } => shader::run(paths, verbose || disasm, disasm),
         Command::Translate {
             paths,
             validate,
             pipelines,
             list,
             jobs,
-            cache: false,
-        } => translate::run(paths, validate, pipelines, list, jobs),
+            warm,
+        } => {
+            // `VICTORY_VIEW_LIMIT=<null slot>`: translate as on a host whose view heap is capped
+            if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
+                victory_shader::emit::set_view_heap_limit(n);
+            }
+            // `VICTORY_HOST_WAVE=32`: translate as for a GPU whose waves are at most 32 lanes
+            if let Some(n) = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse().ok()) {
+                victory_shader::emit::set_host_max_wave(n);
+            }
+            if let Some(file) = warm {
+                return translate::warm(paths, &file, jobs);
+            }
+            translate::run(paths, validate, pipelines, list, jobs)
+        }
         Command::Run {
             exe,
             unimplemented,
@@ -184,14 +181,7 @@ fn main() -> Result<()> {
             execute,
             console,
             title_args: _,
-        } => {
-            let code = run::run(&exe, unimplemented, strict, execute, console)?;
-            if code != 0 {
-                // Preserve all 32 bits of the Windows process status.
-                std::process::exit(code as i32);
-            }
-            Ok(())
-        }
+        } => run::run(&exe, unimplemented, strict, execute, console),
         Command::Config => show_config(),
     }
 }
@@ -212,7 +202,6 @@ fn show_config() -> Result<()> {
     println!("game_dir    : {}", status(&cfg.game_dir));
     println!("cache_dir   : {}", cfg.cache_dir.display());
     println!("data_dir    : {}", cfg.data_dir.display());
-    println!("fidelityfx  : {}", status(&cfg.fidelityfx_dir));
     for t in &cfg.test_titles {
         println!("test_title  : {}", status(&Some(t.clone())));
     }
