@@ -21,6 +21,7 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+mod exchange;
 
 type Why = &'static str;
 
@@ -250,6 +251,8 @@ struct Lower<'a> {
     /// Number of exchanges emitted in the current proven uniform block.
     /// Its parity selects the alternating private LDS bank.
     portable_exchange_bank: Option<u32>,
+    /// Proven adjacent rotations, keyed by their first IR instruction.
+    exchange_fusions: HashMap<usize, exchange::Fusion>,
     /// Pixel: an ordered section (POPS), whose UAVs the host makes
     /// rasterizer-ordered views.
     pops: bool,
@@ -699,6 +702,7 @@ impl<'a> Lower<'a> {
         let mut console_lanes = false;
         let mut portable_lanes = false;
         let mut portable_exchange_bank = None;
+        let mut exchange_fusions = HashMap::new();
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -884,7 +888,7 @@ impl<'a> Lower<'a> {
                 // read pending between exchanges. A uniform multi-block
                 // program retires the outstanding reads before each edge.
                 let linear = p.blocks.len() == 1 && matches!(p.blocks[0].exit, Exit::End);
-                let max_exchanges = p.blocks.iter().map(|b| b.insts.iter().filter(|i| {
+                let mut max_exchanges = p.blocks.iter().map(|b| b.insts.iter().filter(|i| {
                     matches!(i.name(), "ds_bpermute_b32" | "ds_swizzle_b32" | "v_readlane_b32")
                         || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
                 }).count()).max().unwrap_or(0);
@@ -897,6 +901,14 @@ impl<'a> Lower<'a> {
                             && !matches!(i.name(), "s_bcnt1_i32_b64"
                                 | "v_mbcnt_lo_u32_b32" | "v_mbcnt_hi_u32_b32")
                     });
+                if exchange_sequence && linear {
+                    exchange_fusions = exchange::plan(x);
+                    for (&start, fusion) in &exchange_fusions {
+                        // A nonidentity chain becomes one exchange, an
+                        // identity chain becomes an ordinary SSA value.
+                        max_exchanges -= fusion.end - start + usize::from(fusion.shift == 0);
+                    }
+                }
                 // Only scans/extrema with multiple rounds need a second
                 // bank. Ordered floating sums and atomic reductions keep
                 // the original allocation.
@@ -908,6 +920,8 @@ impl<'a> Lower<'a> {
                 // Two banks need at most 8 KiB for 1024 group threads.
                 s.lds_dwords = if scan_banks || exchange_sequence && max_exchanges > 1 {
                     2 * threads
+                } else if exchange_sequence && max_exchanges == 0 {
+                    0
                 } else {
                     threads
                 };
@@ -1007,6 +1021,7 @@ impl<'a> Lower<'a> {
             console_lanes,
             portable_lanes,
             portable_exchange_bank,
+            exchange_fusions,
             pops: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
                 if db_shader_control & 1 << 16 != 0),
             root_memory,
@@ -1716,6 +1731,11 @@ impl<'a> Lower<'a> {
             let mut i = 0;
             self.mode16 = self.round16[b];
             while i < p.blocks[b].insts.len() {
+                if b == 0 && let Some(fusion) = self.exchange_fusions.get(&i).copied() {
+                    self.emit_exchange_fusion(fusion);
+                    i = fusion.end + 1;
+                    continue;
+                }
                 if let Some(&lanes) = self.x.st.discards.get(&(b, i)) {
                     // A pixel's discard: the lanes stay on as helpers.
                     let at = self.cur;
@@ -3746,6 +3766,26 @@ impl<'a> Lower<'a> {
         } else {
             r
         }
+    }
+
+    /// The analysis proves every skipped result has no other use and all
+    /// lanes are present and active. Preserve the source dword verbatim.
+    fn emit_exchange_fusion(&mut self, fusion: exchange::Fusion) {
+        self.mask_ok = true;
+        let val = match self.i32_of(fusion.source) {
+            Ok(x) if fusion.shift == 0 => Val::I32(x),
+            Ok(x) => {
+                let c = self.cur;
+                let flat = self.mesh_thread();
+                let shift = self.s.m.i32(fusion.shift);
+                let mask = self.s.m.i32(63);
+                let shifted = self.s.m.bin(c, Bin::Add, flat, shift);
+                let lane = self.s.m.bin(c, Bin::And, shifted, mask);
+                Val::I32(self.portable_read_lane(x, lane))
+            }
+            Err(why) => Val::Missing(why),
+        };
+        self.vals.insert(fusion.result, val);
     }
 
     fn read_lane(&mut self, x: V, lane: V) -> V {
