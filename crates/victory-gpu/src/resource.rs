@@ -1427,40 +1427,58 @@ pub(crate) fn host_made<'a>(
 
 /// Whether more host copies of textures the title fills may be made for
 /// shaders that pick textures by index (`draw.rs` `heap_textures`): always
-/// up to `FLOOR` bytes of them, beyond that while the card's memory in use
-/// by this process is under nine tenths of the budget the system gives it
+/// up to a budget-scaled floor while below the actual budget; beyond that
+/// the used and reserved bytes must be under nine tenths of the system budget
 /// ([`room_percent`] says another share; `VICTORY_TEXTURE_BUDGET_MB` sets a
 /// limit on those copies' bytes instead). Past the budget the system moves
 /// the card's memory into the PC's, which ended runs 20 and 24.
 #[cfg(windows)]
 pub(crate) fn room() -> bool {
     use std::sync::atomic::Ordering::Relaxed;
-    const FLOOR: u64 = 2 << 30;
-    const WITHOUT_BUDGET: u64 = 4 << 30;
     static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     let limit = *LIMIT.get_or_init(|| {
         let mb = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()?;
-        mb.trim().parse::<u64>().ok().map(|mb| mb << 20)
+        mb.trim().parse::<u64>().ok()?.checked_mul(1 << 20)
     });
-    // (With the tiles of the copies made level by level, whose own bytes
-    // count as none: `crate::tiles`.)
-    let filled = KINDS[1].load(Relaxed) + crate::tiles::given_total();
-    if let Some(limit) = limit {
-        return filled < limit;
+    let filled = KINDS[1].load(Relaxed).saturating_add(crate::tiles::given_total());
+    let memory = crate::host::host().and_then(|h| h.video_memory());
+    let reserved = crate::shadow::card_room_kept().saturating_add(targets_room_kept());
+    texture_room(filled, limit, memory, reserved, room_percent())
+}
+
+/// Admission for speculative texture copies, not for required render targets.
+/// The minimum texture working set must never bypass actual DXGI pressure.
+/// An explicit texture cap is also subordinate to the actual budget.
+#[cfg(windows)]
+fn texture_room(filled: u64, limit: Option<u64>, memory: Option<[u64; 4]>, reserved: u64, percent: u64) -> bool {
+    if limit.is_some_and(|cap| filled >= cap) {
+        return false;
     }
-    if filled < FLOOR {
-        return true;
+    let Some([budget, used, ..]) = memory.filter(|m| m[0] != 0) else {
+        return filled < limit.unwrap_or(4 << 30);
+    };
+    let ceiling = budget / 100 * percent.clamp(50, 97);
+    if used >= ceiling {
+        return false;
     }
-    match crate::host::host().and_then(|h| h.video_memory()) {
-        // What is kept for card copies of title buffers not made yet
-        // (`crate::shadow::card_room_kept`) and for the render targets a
-        // world makes in its first frame ([`targets_room_kept`]) counts as
-        // used.
-        Some([budget, used, ..]) => {
-            used + crate::shadow::card_room_kept() + targets_room_kept() < budget / 100 * room_percent()
-        }
-        None => filled < WITHOUT_BUDGET,
-    }
+    // Preserve the original floor on large adapters. On small local budgets,
+    // scale it down instead of reserving an unconditional two GiB.
+    let floor = (2u64 << 30).min(budget / 4);
+    filled < floor || limit.is_some() || used.saturating_add(reserved) < ceiling
+}
+
+#[cfg(all(windows, test))]
+#[test]
+fn texture_room_respects_actual_budget_and_small_adapter_floor() {
+    let gib = 1u64 << 30;
+    assert!(!texture_room(0, None, Some([6 * gib, 6 * gib, 0, 0]), 0, 90));
+    assert!(!texture_room(0, Some(4 * gib), Some([6 * gib, 6 * gib, 0, 0]), 0, 90));
+    assert!(!texture_room(2 * gib, Some(2 * gib), Some([8 * gib, 3 * gib, 0, 0]), 0, 90));
+    assert!(texture_room(gib, None, Some([6 * gib, 3 * gib, 0, 0]), 3 * gib, 90));
+    assert!(!texture_room(2 * gib, None, Some([6 * gib, 3 * gib, 0, 0]), 3 * gib, 90));
+    assert!(texture_room(2 * gib, None, Some([12 * gib, 3 * gib, 0, 0]), 3 * gib, 90));
+    assert!(texture_room(gib, None, None, 0, 90));
+    assert!(!texture_room(4 * gib, None, Some([0; 4]), 0, 90));
 }
 
 /// The bytes of the card's memory the texture queue leaves free for
