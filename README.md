@@ -1066,6 +1066,34 @@ cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --release -p victory-shader --lib --locked benchmark_wave64_portable_exchange -- --ignored --test-threads=1 --nocapture
 ```
 
+### Wave64 exchange fusion (candidate)
+
+A conservative SSA pass composes consecutive `ds_bpermute_b32`
+rotations when the address is proven to be the one-dimensional thread
+ID times four, all logical waves are complete, EXEC is full, control
+flow is a single terminal block, and intermediate results have no
+other readers. Offsets compose modulo 64; an identity requires no
+shared scratch or barrier. Partial groups, masked operations, unknown
+addresses, observed intermediate values and intervening ALU operations
+retain the previously validated lowering.
+
+For the synthetic chain of 64 one-lane rotations the expected emitted
+barrier count is zero; a chain of 63 requires one. This is workload
+elimination, not a measurement of faster individual exchanges. A
+second opt-in benchmark interleaves lane-local arithmetic so that
+the repeated exchanges cannot be fused by this pass. Both benchmarks
+report the emitted barrier and scratch budgets.
+
+The candidate needs compilation, strict Clippy, full workspace and
+hardware/WARP validation before promotion to the stable NVIDIA branch.
+No game compatibility or measured speedup is claimed.
+
+```powershell
+cargo test -p victory-shader --lib --locked wave64_ -- --test-threads=1 --nocapture
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --release -p victory-shader --lib --locked benchmark_wave64_portable_exchange -- --ignored --test-threads=1 --nocapture
+```
+
 ### Development roadmap
 
 - [x] Build the project on the NVIDIA test machine.
