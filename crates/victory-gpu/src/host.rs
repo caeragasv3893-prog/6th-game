@@ -140,6 +140,54 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
     ok.then_some(m.ullAvailPhys)
 }
 
+/// Idle cache budgets are adjusted only on the periodic sweep. This avoids
+/// a system memory query for every buffer returned to a pool.
+static IDLE_CACHE_SHIFT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn idle_cache_shift(previous: u32, available: u64) -> u32 {
+    const GIB: u64 = 1 << 30;
+    // Hysteresis prevents releasing and rebuilding caches every second.
+    if available < 2 * GIB || previous == 2 && available < 3 * GIB {
+        2
+    } else if available < 4 * GIB || previous != 0 && available < 5 * GIB {
+        1
+    } else {
+        0
+    }
+}
+
+pub(crate) fn idle_cache_limit(normal: u64) -> u64 {
+    normal >> IDLE_CACHE_SHIFT.load(Ordering::Relaxed)
+}
+
+fn refresh_idle_cache_pressure() {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_ADAPTIVE_CACHE").is_none_or(|v| v != "0")) {
+        return;
+    }
+    if let Some(available) = available_physical_ram() {
+        let previous = IDLE_CACHE_SHIFT.load(Ordering::Relaxed);
+        let next = idle_cache_shift(previous, available);
+        IDLE_CACHE_SHIFT.store(next, Ordering::Relaxed);
+        if next != previous {
+            tracing::info!(available_mib = available >> 20, cache_shift = next, "idle memory cache budget changed");
+        }
+    }
+}
+
+#[test]
+fn idle_cache_pressure_has_hysteresis() {
+    let gib = 1u64 << 30;
+    assert_eq!(idle_cache_shift(0, 6 * gib), 0);
+    assert_eq!(idle_cache_shift(0, 3 * gib), 1);
+    assert_eq!(idle_cache_shift(1, 4 * gib), 1);
+    assert_eq!(idle_cache_shift(1, 5 * gib), 0);
+    assert_eq!(idle_cache_shift(0, gib), 2);
+    assert_eq!(idle_cache_shift(2, 2 * gib), 2);
+    assert_eq!(idle_cache_shift(2, 3 * gib), 1);
+    assert_eq!(idle_cache_shift(2, 5 * gib), 0);
+}
+
 /// Effective idle timeout (in milliseconds) for VRAM-backed host textures,
 /// scaled down under VRAM pressure. Never returns less than 1,000 ms so
 /// handles not yet recorded into a list or slot remain protected.
@@ -221,10 +269,14 @@ fn sweep() {
     {
         return;
     }
+    refresh_idle_cache_pressure();
     crate::pipeline::trim_library();
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
+    crate::shadow::trim_snapshot_pool();
+    crate::texture::trim_spare_staging();
+    trim_spare_scratch();
 }
 
 /// Drops `object` once every submission running now has finished: at once
@@ -2361,7 +2413,7 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         for (chunk, size) in chunks {
             let back = if scratch_pool() {
-                spare.give(chunk, size, SPARE_MOST)
+                spare.give(chunk, size, idle_cache_limit(SPARE_MOST))
             } else {
                 Some(chunk)
             };
@@ -2379,6 +2431,25 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
         }
     }
     // Freed outside the lock.
+    drop(freed);
+}
+
+/// Spare chunks have no live list owner. Drop them outside the pool lock.
+fn trim_spare_scratch() {
+    let limit = idle_cache_limit(SPARE_MOST);
+    let mut freed = Vec::new();
+    {
+        let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        while spare.bytes > limit {
+            let Some((chunk, size)) = spare.kept.pop() else { break };
+            spare.bytes -= size;
+            ALIVE[1].fetch_sub(1, Ordering::Relaxed);
+            ALIVE[2].fetch_sub(size, Ordering::Relaxed);
+            ALIVE[3].fetch_sub(1, Ordering::Relaxed);
+            ALIVE[4].fetch_sub(size, Ordering::Relaxed);
+            freed.push(chunk);
+        }
+    }
     drop(freed);
 }
 

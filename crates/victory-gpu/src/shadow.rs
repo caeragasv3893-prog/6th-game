@@ -1372,20 +1372,58 @@ fn pooled(n: usize) -> Vec<u8> {
     v
 }
 
-/// Returns a snapshot buffer to the pool: at most 8 kept, the largest, and
-/// of those the largest one and the next ones up to `KEPT` bytes in all.
+/// Strict aggregate budget: even the largest snapshot must fit. An active
+/// snapshot is never trimmed; only buffers already returned to the pool.
+fn snapshot_limit() -> usize {
+    static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let normal = *LIMIT.get_or_init(|| {
+        std::env::var("VICTORY_SNAPSHOT_POOL_MB").ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .and_then(|mb| mb.checked_mul(1 << 20))
+            .unwrap_or(512 << 20)
+    });
+    crate::host::idle_cache_limit(normal).min(usize::MAX as u64) as usize
+}
+
+fn trim_snapshots(pool: &mut Vec<Vec<u8>>, limit: usize) {
+    pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
+    let mut remaining = limit;
+    let mut count = 0;
+    pool.retain(|v| {
+        let size = v.capacity();
+        if size == 0 || size > remaining || count == 8 {
+            return false;
+        }
+        remaining -= size;
+        count += 1;
+        true
+    });
+}
+
 fn give_back(v: Vec<u8>) {
-    const KEPT: usize = 512 << 20;
+    let limit = snapshot_limit();
+    if v.capacity() > limit {
+        return;
+    }
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
-    pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
-    pool.truncate(8);
-    let (mut seen, mut total) = (0, 0usize);
-    pool.retain(|v| {
-        seen += 1;
-        total = total.saturating_add(v.capacity());
-        seen == 1 || total <= KEPT
-    });
+    trim_snapshots(&mut pool, limit);
+}
+
+pub(crate) fn trim_snapshot_pool() {
+    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    trim_snapshots(&mut pool, snapshot_limit());
+}
+
+#[test]
+fn snapshot_pool_strict_budget() {
+    let mut pool: Vec<Vec<u8>> = [512, 128, 64, 32].into_iter().map(Vec::with_capacity).collect();
+    trim_snapshots(&mut pool, 192);
+    assert_eq!(pool.iter().map(Vec::capacity).sum::<usize>(), 192);
+    trim_snapshots(&mut pool, 64);
+    assert_eq!(pool.iter().map(Vec::capacity).sum::<usize>(), 64);
+    trim_snapshots(&mut pool, 0);
+    assert!(pool.is_empty());
 }
 
 const NOT_WATCHED: u8 = 2;

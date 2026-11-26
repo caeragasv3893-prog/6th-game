@@ -163,9 +163,34 @@ fn staging_pool() -> bool {
 /// The most bytes of staging buffers kept spare (`VICTORY_STAGING_POOL_MB`).
 fn spare_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *MOST.get_or_init(|| {
-        std::env::var("VICTORY_STAGING_POOL_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).map_or(SPARE_MOST.0, |mb| mb << 20)
-    })
+    let normal = *MOST.get_or_init(|| {
+        std::env::var("VICTORY_STAGING_POOL_MB").ok().and_then(|v| v.trim().parse::<u64>().ok())
+            .and_then(|mb| mb.checked_mul(1 << 20)).unwrap_or(SPARE_MOST.0)
+    });
+    crate::host::idle_cache_limit(normal)
+}
+
+/// Drop only already-spare upload buffers, largest first. The active staging
+/// table and command-list references are unaffected.
+pub(crate) fn trim_spare_staging() {
+    let limit = spare_most();
+    let mut freed = Vec::new();
+    {
+        let mut all = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        while all.1 > limit {
+            let Some(mut entry) = all.0.last_entry() else { break };
+            let size = *entry.key();
+            let item = entry.get_mut().pop();
+            if entry.get().is_empty() {
+                entry.remove();
+            }
+            if let Some(item) = item {
+                all.1 -= size;
+                freed.push(item);
+            }
+        }
+    }
+    drop(freed);
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
