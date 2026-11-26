@@ -704,11 +704,90 @@ fn wave64_exchange_barrier_budget() {
                 threads,
                 true,
             );
-            assert_eq!(barriers, exchanges as usize, "{threads} threads, {exchanges} exchanges");
-            let banks = exchanges.min(2);
+            let emitted = if threads.is_multiple_of(64) {
+                u32::from(exchanges % 64 != 0)
+            } else {
+                exchanges
+            };
+            assert_eq!(barriers, emitted as usize, "{threads} threads, {exchanges} exchanges");
+            let banks = emitted.min(2);
             assert_eq!(scratch, banks * threads, "{threads} threads, {exchanges} exchanges");
         }
     }
+}
+
+/// The composed source must be correct for arbitrary data; an observed
+/// intermediate or an intervening ALU operation must prevent fusion.
+#[test]
+fn wave64_exchange_fusion_guards_and_identity() {
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        for threads in [64u32, 96, 128, 1024] {
+            for (first, second, observe) in [(1u32, 63u32, false), (17, 32, false), (1, 63, true)] {
+                if observe && threads == 1024 {
+                    continue;
+                }
+                let mut words = vec![
+                    0xBE84_0300, 0xBE85_0380,
+                    0xF408_0202, 0xFA00_0000,
+                    0x3404_0082, 0xBF8C_C07F,
+                    0xDACC_0000 | (first * 4), 0x0300_0002, 0xBF8C_C07F,
+                    0xDACC_0000 | (second * 4), 0x0400_0302, 0xBF8C_C07F,
+                ];
+                if observe {
+                    // An extra read of the first result after the chain.
+                    words.extend([0xE070_1000 | (threads * 4), 0x8002_0302]);
+                }
+                words.extend([0xE070_1000, 0x8002_0402, 0xBF81_0000]);
+                let (shader, barriers, scratch) = build_wave_with_metrics(
+                    &words,
+                    vec![param(RootType::Table, 0)],
+                    vec![entry(ResourceType::Uav, 4, 0)],
+                    threads,
+                    true,
+                );
+                let emitted = if observe || !threads.is_multiple_of(64) {
+                    2
+                } else {
+                    u32::from((first + second) % 64 != 0)
+                };
+                assert_eq!(barriers, emitted as usize, "{label}: {threads}, {first}, {second}, {observe}");
+                assert_eq!(scratch, threads * emitted);
+                let (root, pso) = host.compute_pipeline(&shader).unwrap_or_else(
+                    |e| panic!("{label}: compute pipeline failed: {e}"),
+                );
+                let rotate = |input: &[u32], offset| -> Vec<u32> {
+                    (0..threads).map(|lane| {
+                        let src = (lane & !63) | ((lane + offset) & 63);
+                        input.get(src as usize).copied().unwrap_or(0)
+                    }).collect()
+                };
+                let input: Vec<u32> = (0..threads).collect();
+                let intermediate = rotate(&input, first);
+                let mut want = rotate(&intermediate, second);
+                if observe {
+                    want.extend(intermediate);
+                }
+                let dispatch = Dispatch {
+                    roots: vec![(0, Root::Constants(vec![0; shader.user_data_dwords().max(1) as usize]))],
+                    views: &[View::RawUav(want.len() as u32)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                };
+                let out = host.dispatch(&root, &pso, &dispatch).unwrap();
+                assert_eq!(out[0], want, "{label}: {threads}, {first}, {second}, {observe}");
+            }
+        }
+        eprintln!("{label}: exchange fusion, identities and observable intermediate passed");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
 
 /// Reuse both LDS banks repeatedly, including absent sources in partial
@@ -863,13 +942,14 @@ fn benchmark_wave64_portable_exchange() {
                 words.extend([0xDACC_0004, 0x0300_0302, 0xBF8C_C07F]);
             }
             words.extend([0xE070_1000, 0x8002_0302, 0xBF81_0000]);
-            let shader = build_wave(
+            let (shader, barriers, scratch) = build_wave_with_metrics(
                 &words,
                 vec![param(RootType::Table, 0)],
                 vec![entry(ResourceType::Uav, 4, 0)],
                 128,
                 true,
             );
+            eprintln!("{label}: {exchanges} source exchanges -> {barriers} emitted barriers, {scratch} scratch dwords");
             let (root, pso) = host.compute_pipeline(&shader).unwrap_or_else(
                 |e| panic!("{label}: compute pipeline failed: {e}"),
             );
